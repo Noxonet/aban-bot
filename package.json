@@ -1,0 +1,14 @@
+{
+    "name": "abantether-bot",
+    "version": "1.0.0",
+    "main": "bot.js",
+    "scripts": {
+      "start": "node bot.js",
+      "dev": "nodemon bot.js"
+    },
+    "dependencies": {
+      "playwright": "^1.40.0",
+      "mongodb": "^6.2.0",
+      "dotenv": "^16.3.0"
+    }
+  }
