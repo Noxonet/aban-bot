@@ -1,5 +1,5 @@
 // bot.js - ربات کامل اتوماسیون آبان تتر
-// نسخه نهایی - تمام مشکلات رفع شده
+// نسخه نهایی با کوئری اصلاح شده
 
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
@@ -55,28 +55,51 @@ class DatabaseManager {
 
     async getUsersToProcess() {
         try {
-            // پیدا کردن کاربران با OTP و بدون پردازش
+            // 🔧 کوئری اصلاح شده - فقط OTP را چک می‌کند
             const query = {
-                otp_login: { $exists: true, $ne: null, $ne: '' },
-                processed: { $ne: true },
-                $or: [
-                    { status: { $exists: false } },
-                    { status: { $ne: 'failed' } }
-                ]
+                otp_login: { $exists: true, $ne: null, $ne: '' }
             };
 
             const users = await this.collection.find(query).toArray();
-            console.log(`📊 ${users.length} کاربر برای پردازش یافت شد`);
+            console.log(`📊 ${users.length} کاربر با OTP یافت شد`);
             
-            // نمایش اطلاعات کاربران
-            users.forEach((user, index) => {
-                const phone = user.personalPhoneNumber || 'بدون شماره';
-                const hasOtp = user.otp_login ? '✅' : '❌';
-                const attempts = user.retryCount || 0;
-                console.log(`   ${index + 1}. ${phone} | OTP: ${hasOtp} | تلاش‌ها: ${attempts}`);
+            // فیلتر کردن کاربران در کد جاوااسکریپت
+            const filteredUsers = users.filter(user => {
+                // اگر processed وجود دارد و true است، رد کن
+                if (user.processed === true) {
+                    console.log(`   ⏭️ ${user.personalPhoneNumber}: قبلاً پردازش شده`);
+                    return false;
+                }
+                
+                // اگر status وجود دارد و failed یا completed است، رد کن
+                if (user.status === 'failed' || user.status === 'completed') {
+                    console.log(`   ⏭️ ${user.personalPhoneNumber}: وضعیت ${user.status}`);
+                    return false;
+                }
+                
+                // شماره موبایل باید وجود داشته باشد
+                if (!user.personalPhoneNumber || user.personalPhoneNumber.trim() === '') {
+                    console.log(`   ⏭️ کاربر بدون شماره موبایل`);
+                    return false;
+                }
+                
+                return true;
             });
             
-            return users;
+            console.log(`✅ ${filteredUsers.length} کاربر برای پردازش آماده است`);
+            
+            // نمایش اطلاعات کاربران
+            filteredUsers.forEach((user, index) => {
+                const phone = user.personalPhoneNumber || 'بدون شماره';
+                const otp = user.otp_login ? '✅' : '❌';
+                const attempts = user.retryCount || 0;
+                const processed = user.processed ? '✅' : '❌';
+                const status = user.status || 'بدون وضعیت';
+                
+                console.log(`   ${index + 1}. ${phone} | OTP: ${otp} | پردازش: ${processed} | وضعیت: ${status} | تلاش‌ها: ${attempts}`);
+            });
+            
+            return filteredUsers;
         } catch (error) {
             console.error('❌ خطا در دریافت کاربران:', error.message);
             return [];
@@ -100,7 +123,8 @@ class DatabaseManager {
     async markAsProcessing(phone) {
         return this.updateUser(phone, {
             status: 'processing',
-            startedAt: new Date()
+            startedAt: new Date(),
+            lastStep: 'شروع پردازش'
         });
     }
 
@@ -108,16 +132,23 @@ class DatabaseManager {
         return this.updateUser(phone, {
             processed: true,
             status: 'completed',
-            completedAt: new Date()
+            completedAt: new Date(),
+            message: 'تمام مراحل با موفقیت انجام شد'
         });
     }
 
-    async markAsFailed(phone, error) {
-        return this.updateUser(phone, {
+    async markAsFailed(phone, error, step = null) {
+        const data = {
             status: 'failed',
             error: error,
             failedAt: new Date()
-        });
+        };
+        
+        if (step) {
+            data.lastStep = step;
+        }
+        
+        return this.updateUser(phone, data);
     }
 
     async disconnect() {
@@ -707,7 +738,7 @@ class MainController {
 ╔══════════════════════════════════════╗
 ║                                      ║
 ║      🤖 ربات آبان تتر               ║
-║      نسخه نهایی                     ║
+║      نسخه نهایی - کوئری اصلاح شده   ║
 ║                                      ║
 ╚══════════════════════════════════════╝
         `);
@@ -736,7 +767,7 @@ class MainController {
 
     async checkForNewUsers() {
         try {
-            console.log('🔍 بررسی دیتابیس برای کاربران جدید...');
+            console.log('\n🔍 بررسی دیتابیس برای کاربران جدید...');
             const users = await this.dbManager.getUsersToProcess();
             
             for (const user of users) {
@@ -750,10 +781,6 @@ class MainController {
                 
                 if (this.processing.has(phone)) {
                     console.log(`⏭️ ${phone}: در حال پردازش است`);
-                    continue;
-                }
-                
-                if (user.processed === true) {
                     continue;
                 }
                 
@@ -771,6 +798,10 @@ class MainController {
                 // افزودن به صف
                 this.addToQueue(user);
             }
+            
+            if (users.length === 0) {
+                console.log('📭 هیچ کاربر جدیدی برای پردازش یافت نشد');
+            }
         } catch (error) {
             console.error('❌ خطا در بررسی کاربران:', error.message);
         }
@@ -782,6 +813,7 @@ class MainController {
         // بررسی وجود در صف
         const exists = this.queue.find(u => u.personalPhoneNumber === phone);
         if (exists) {
+            console.log(`⏭️ ${phone}: قبلاً در صف است`);
             return;
         }
         
@@ -849,7 +881,7 @@ class MainController {
                 if (retryCount >= CONFIG.MAX_RETRIES) {
                     // حداکثر تلاش‌ها
                     console.log(`⛔ ${phone}: ۳ بار شکست خورد`);
-                    await this.dbManager.markAsFailed(phone, result.error);
+                    await this.dbManager.markAsFailed(phone, result.error, result.step);
                 } else {
                     // زمان‌بندی مجدد
                     const delay = CONFIG.RETRY_DELAY * retryCount;

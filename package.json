@@ -1,28 +1,19 @@
 {
-  "name": "abantether-auto-bot",
-  "version": "1.0.0",
-  "description": "ربات کامل اتوماسیون آبان تتر",
+  "name": "abantether-robot-final-fixed",
+  "version": "1.0.1",
+  "description": "ربات نهایی اتوماسیون آبان تتر - کوئری اصلاح شده",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
     "dev": "node bot.js",
-    "test": "echo \"No tests specified\" && exit 0",
-    "install-browser": "npx playwright install chromium"
+    "install-browser": "npx playwright install chromium",
+    "test-db": "node -e \"const {MongoClient}=require('mongodb');async function t(){const c=new MongoClient('mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority');await c.connect();const db=c.db('ZarrinApp');const col=db.collection('zarinapp');const count=await col.countDocuments({otp_login:{\\$exists:true,\\$ne:null,\\$ne:''}});console.log('کاربران با OTP:',count);await c.close();}t().catch(console.error);\""
   },
-  "keywords": [
-    "abantether",
-    "bot",
-    "automation",
-    "crypto",
-    "usdt"
-  ],
-  "author": "Your Name",
+  "keywords": ["abantether", "bot", "automation", "crypto"],
+  "author": "",
   "license": "MIT",
   "dependencies": {
     "playwright": "^1.40.0",
     "mongodb": "^6.0.0"
-  },
-  "engines": {
-    "node": ">=16.0.0"
   }
 }
