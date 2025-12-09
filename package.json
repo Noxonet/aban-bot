@@ -1,17 +1,28 @@
 {
-  "name": "abantether-bot",
+  "name": "abantether-auto-bot",
   "version": "1.0.0",
+  "description": "ربات کامل اتوماسیون آبان تتر",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js",
-    "dev": "node bot.js"
+    "dev": "node bot.js",
+    "test": "echo \"No tests specified\" && exit 0",
+    "install-browser": "npx playwright install chromium"
   },
+  "keywords": [
+    "abantether",
+    "bot",
+    "automation",
+    "crypto",
+    "usdt"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
   "dependencies": {
     "playwright": "^1.40.0",
-    "mongodb": "^6.2.0",
-    "dotenv": "^16.3.0"
+    "mongodb": "^6.0.0"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=16.0.0"
   }
 }
