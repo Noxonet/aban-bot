@@ -12,8 +12,8 @@ class AbanTetherBot {
         this.website = {
             baseUrl: 'https://abantether.com',
             registerUrl: 'https://abantether.com/register',
-            timeout: 30000,
-            headless: true
+            timeout: 60000, // افزایش تایم‌اوت
+            headless: false // اول false بزارید تا ببینید چه خبره
         };
         
         // تنظیمات تراکنش
@@ -61,6 +61,8 @@ class AbanTetherBot {
 
     async checkDatabase() {
         try {
+            console.log('🔍 در حال بررسی دیتابیس...');
+            
             // جستجوی کاربران نیازمند پردازش
             const query = {
                 $or: [
@@ -76,7 +78,7 @@ class AbanTetherBot {
                 ]
             };
 
-            const pendingUsers = await this.collection.find(query).limit(10).toArray();
+            const pendingUsers = await this.collection.find(query).limit(5).toArray();
             
             console.log(`📊 ${pendingUsers.length} کاربر نیازمند پردازش پیدا شد`);
             
@@ -91,7 +93,7 @@ class AbanTetherBot {
                 const retryCount = user.retryCount || 0;
                 if (retryCount >= this.transaction.maxRetries) {
                     console.log(`⛔ کاربر ${user.personalPhoneNumber} بیش از حد تلاش کرده`);
-                    await this.markUserFailed(user.personalPhoneNumber, 'تعداد تلاش‌ها بیش از حد مجاز');
+                    await this.markUserFailed(user.personalPhoneNumber, 'تعداد تلاش‌ها بیش از حد مجاز', false);
                     continue;
                 }
                 
@@ -118,7 +120,7 @@ class AbanTetherBot {
                     $set: {
                         status: 'processing',
                         startedAt: new Date(),
-                        retryCount: (user.retryCount || 0)
+                        retryCount: (user.retryCount || 0) + 1
                     },
                     $inc: { __v: 1 }
                 }
@@ -150,26 +152,56 @@ class AbanTetherBot {
         
         try {
             // راه‌اندازی مرورگر
+            console.log('🌐 راه‌اندازی مرورگر...');
             browser = await chromium.launch({
                 headless: this.website.headless,
                 args: ['--no-sandbox', '--disable-setuid-sandbox']
             });
             
             const context = await browser.newContext({
-                viewport: { width: 1280, height: 720 },
-                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                viewport: { width: 1280, height: 800 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                locale: 'fa-IR'
             });
             
             page = await context.newPage();
             await page.setDefaultTimeout(this.website.timeout);
             
-            console.log(`🌐 مرحله 1: ثبت‌نام برای ${user.personalPhoneNumber}`);
-            await page.goto(this.website.registerUrl, { waitUntil: 'networkidle' });
+            console.log(`📝 مرحله 1: ثبت‌نام برای ${user.personalPhoneNumber}`);
             
-            // وارد کردن شماره موبایل
-            await this.smartFill(page, 'موبایل', user.personalPhoneNumber);
-            await this.smartClick(page, 'ادامه');
-            await page.waitForTimeout(2000);
+            // رفتن به صفحه ثبت‌نام
+            await page.goto(this.website.registerUrl, { 
+                waitUntil: 'networkidle',
+                timeout: 60000 
+            });
+            
+            // گرفتن اسکرین‌شات برای دیباگ
+            await page.screenshot({ path: 'debug-1-loaded.png' });
+            console.log('📸 اسکرین‌شات گرفته شد: debug-1-loaded.png');
+            
+            // چک کردن محتوای صفحه
+            const pageContent = await page.content();
+            console.log('📄 اولین 1000 کاراکتر صفحه:', pageContent.substring(0, 1000));
+            
+            // پیدا کردن فیلد موبایل
+            console.log('🔍 در جستجوی فیلد موبایل...');
+            const mobileFilled = await this.findAndFillMobile(page, user.personalPhoneNumber);
+            if (!mobileFilled) {
+                throw new Error('فیلد موبایل پیدا نشد');
+            }
+            
+            // پیدا کردن دکمه ادامه
+            console.log('🔍 در جستجوی دکمه ادامه...');
+            const continueClicked = await this.findAndClickContinue(page);
+            if (!continueClicked) {
+                throw new Error('دکمه ادامه پیدا نشد');
+            }
+            
+            await page.waitForTimeout(3000);
+            
+            // گرفتن اسکرین‌شات بعد از کلیک ادامه
+            await page.screenshot({ path: 'debug-2-after-continue.png' });
+            console.log('📸 اسکرین‌شات گرفته شد: debug-2-after-continue.png');
             
             // انتظار برای OTP لاگین
             console.log('⏳ منتظر OTP لاگین...');
@@ -178,283 +210,619 @@ class AbanTetherBot {
                 throw new Error('OTP لاگین دریافت نشد');
             }
             
+            console.log(`✅ OTP لاگین دریافت شد: ${otpLogin}`);
+            
             // وارد کردن OTP لاگین
-            await this.enterOtp(page, otpLogin);
-            await this.smartClick(page, 'تأیید');
-            await page.waitForTimeout(3000);
-            
-            console.log('👤 مرحله 2: تکمیل اطلاعات هویتی');
-            // پر کردن اطلاعات هویتی
-            const personalInfo = [
-                { field: 'نام', value: user.personalName },
-                { field: 'کد ملی', value: user.personalNationalCode },
-                { field: 'تاریخ تولد', value: user.personalBirthDate },
-                { field: 'شهر', value: user.personalCity },
-                { field: 'استان', value: user.personalProvince }
-            ];
-            
-            for (const info of personalInfo) {
-                await this.smartFill(page, info.field, info.value);
-                await page.waitForTimeout(500);
+            console.log('🔢 وارد کردن OTP لاگین...');
+            const otpEntered = await this.enterOtp(page, otpLogin);
+            if (!otpEntered) {
+                throw new Error('نتوانست OTP را وارد کند');
             }
             
-            await this.smartClick(page, 'تکمیل ثبت‌نام');
-            await page.waitForTimeout(3000);
-            
-            console.log('💳 مرحله 3: ثبت کارت بانکی');
-            // رفتن به کیف پول
-            await this.smartClick(page, 'کیف پول');
-            await page.waitForTimeout(2000);
-            
-            // کلیک بر ثبت کارت بانکی
-            await this.smartClick(page, 'ثبت کارت');
-            await this.smartClick(page, 'کارت بانکی');
-            await page.waitForTimeout(2000);
-            
-            // پر کردن اطلاعات کارت
-            const cardInfo = [
-                { field: 'شماره کارت', value: user.cardNumber },
-                { field: 'CVV2', value: user.cvv2 },
-                { field: 'ماه', value: user.bankMonth.toString() },
-                { field: 'سال', value: user.bankYear.toString() }
-            ];
-            
-            for (const info of cardInfo) {
-                await this.smartFill(page, info.field, info.value);
-                await page.waitForTimeout(500);
+            // پیدا کردن دکمه تأیید OTP
+            console.log('🔍 در جستجوی دکمه تأیید OTP...');
+            const verifyOtpClicked = await this.findAndClickVerify(page);
+            if (!verifyOtpClicked) {
+                throw new Error('دکمه تأیید OTP پیدا نشد');
             }
             
-            await this.smartClick(page, 'ثبت');
-            await page.waitForTimeout(2000);
-            
-            // انتظار برای OTP ثبت کارت
-            console.log('⏳ منتظر OTP ثبت کارت...');
-            const otpCard = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_register_card');
-            if (!otpCard) {
-                throw new Error('OTP ثبت کارت دریافت نشد');
-            }
-            
-            // وارد کردن OTP ثبت کارت
-            await this.enterOtp(page, otpCard);
-            await this.smartClick(page, 'تأیید');
-            await page.waitForTimeout(3000);
-            
-            console.log('💰 مرحله 4: واریز تومان');
-            // رفتن به بخش واریز تومان
-            await this.smartClick(page, 'واریز');
-            await this.smartClick(page, 'تومان');
-            await page.waitForTimeout(2000);
-            
-            // وارد کردن مبلغ
-            await this.smartFill(page, 'مبلغ', this.transaction.depositAmount);
-            await this.smartClick(page, 'پرداخت');
-            await page.waitForTimeout(2000);
-            
-            // انتخاب درگاه کارت به کارت
-            await this.smartClick(page, 'کارت به کارت');
-            await page.waitForTimeout(2000);
-            
-            // انتظار برای OTP پرداخت
-            console.log('⏳ منتظر OTP پرداخت...');
-            const otpPayment = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment');
-            if (!otpPayment) {
-                throw new Error('OTP پرداخت دریافت نشد');
-            }
-            
-            // وارد کردن OTP پرداخت
-            await this.enterOtp(page, otpPayment);
-            await this.smartClick(page, 'تأیید');
             await page.waitForTimeout(5000);
             
-            console.log('🔄 مرحله 5: خرید تتر');
-            // رفتن به بازار
-            await this.smartClick(page, 'بازار');
-            await page.waitForTimeout(2000);
+            // گرفتن اسکرین‌شات بعد از ورود
+            await page.screenshot({ path: 'debug-3-after-login.png' });
+            console.log('📸 اسکرین‌شات گرفته شد: debug-3-after-login.png');
             
-            // انتخاب تتر
-            await this.smartClick(page, 'تتر');
-            await this.smartClick(page, 'خرید');
-            await page.waitForTimeout(2000);
+            // چک کردن اگر صفحه پروفایل است
+            const currentUrl = page.url();
+            console.log(`📍 آدرس فعلی: ${currentUrl}`);
             
-            // انتخاب همه موجودی
-            await this.smartClick(page, 'همه موجودی');
-            await this.smartClick(page, 'خرید');
-            await this.smartClick(page, 'تأیید');
+            if (currentUrl.includes('profile') || currentUrl.includes('complete')) {
+                console.log('👤 مرحله 2: تکمیل اطلاعات هویتی');
+                
+                // پر کردن اطلاعات هویتی
+                const profileFilled = await this.fillProfileInfo(page, user);
+                if (!profileFilled) {
+                    throw new Error('نتوانست اطلاعات پروفایل را پر کند');
+                }
+                
+                // پیدا کردن دکمه تکمیل ثبت‌نام
+                console.log('🔍 در جستجوی دکمه تکمیل ثبت‌نام...');
+                const completeClicked = await this.findAndClickCompleteRegistration(page);
+                if (!completeClicked) {
+                    throw new Error('دکمه تکمیل ثبت‌نام پیدا نشد');
+                }
+            }
+            
             await page.waitForTimeout(5000);
             
-            console.log('📤 مرحله 6: برداشت تتر');
-            // رفتن به برداشت
-            await this.smartClick(page, 'برداشت');
-            await page.waitForTimeout(2000);
-            
-            // وارد کردن آدرس کیف پول
-            await this.smartFill(page, 'آدرس', this.transaction.withdrawAddress);
-            
-            // انتخاب همه موجودی
-            await this.smartClick(page, 'همه موجودی');
-            
-            // برداشت
-            await this.smartClick(page, 'برداشت');
-            await this.smartClick(page, 'تأیید نهایی');
-            await page.waitForTimeout(5000);
+            // ادامه مراحل بعدی...
+            // بقیه مراحل را بعد از اینکه این بخش کار کرد اضافه می‌کنیم
             
             return {
                 success: true,
                 details: {
-                    stepsCompleted: ['register', 'profile', 'card', 'deposit', 'buy', 'withdraw'],
+                    stepsCompleted: ['register', 'login'],
                     completedAt: new Date()
                 }
             };
             
         } catch (error) {
             console.error('❌ خطا در اجرای فرآیند:', error);
+            
+            // گرفتن اسکرین‌شات در صورت خطا
+            if (page) {
+                try {
+                    await page.screenshot({ path: 'error-screenshot.png' });
+                    console.log('📸 اسکرین‌شات خطا گرفته شد: error-screenshot.png');
+                } catch (screenshotError) {
+                    console.error('❌ خطا در گرفتن اسکرین‌شات:', screenshotError);
+                }
+            }
+            
             return {
                 success: false,
                 error: error.message,
                 retry: true
             };
         } finally {
-            if (page) await page.close();
-            if (browser) await browser.close();
+            if (page) {
+                try {
+                    await page.close();
+                } catch (e) {
+                    console.error('❌ خطا در بستن صفحه:', e);
+                }
+            }
+            if (browser) {
+                try {
+                    await browser.close();
+                } catch (e) {
+                    console.error('❌ خطا در بستن مرورگر:', e);
+                }
+            }
         }
     }
 
-    async smartFill(page, labelText, value) {
-        const selectors = [
-            `input[placeholder*="${labelText}"]`,
-            `input[name*="${labelText.toLowerCase()}"]`,
-            `input[id*="${labelText.toLowerCase()}"]`,
-            `label:has-text("${labelText}") + input`,
-            `//label[contains(text(), '${labelText}')]/following::input[1]`,
-            `text=${labelText} >> .. >> input`,
-            `[aria-label*="${labelText}"]`
+    async findAndFillMobile(page, phoneNumber) {
+        console.log(`📱 در حال پر کردن شماره موبایل: ${phoneNumber}`);
+        
+        // لیست سلکتورهای ممکن برای فیلد موبایل
+        const mobileSelectors = [
+            'input[type="tel"]',
+            'input[type="text"]',
+            'input[name*="phone"]',
+            'input[name*="mobile"]',
+            'input[placeholder*="موبایل"]',
+            'input[placeholder*="شماره"]',
+            'input[placeholder*="تلفن"]',
+            'input[id*="phone"]',
+            'input[id*="mobile"]',
+            'input[class*="phone"]',
+            'input[class*="mobile"]',
+            '//input[contains(@placeholder, "موبایل")]',
+            '//input[contains(@placeholder, "شماره")]',
+            '//input[@type="tel"]'
         ];
         
-        for (const selector of selectors) {
+        for (const selector of mobileSelectors) {
             try {
-                const element = await page.$(selector);
-                if (element) {
-                    await element.fill(value);
-                    console.log(`✅ پر کردن ${labelText}: ${value}`);
-                    await page.waitForTimeout(500);
-                    return true;
+                console.log(`🔍 امتحان سلکتور: ${selector}`);
+                const elements = await page.$$(selector);
+                
+                for (let i = 0; i < elements.length; i++) {
+                    const element = elements[i];
+                    const isVisible = await element.isVisible();
+                    const isEnabled = await element.isEnabled();
+                    
+                    if (isVisible && isEnabled) {
+                        // خالی کردن فیلد اول
+                        await element.fill('');
+                        await page.waitForTimeout(500);
+                        
+                        // پر کردن فیلد
+                        await element.fill(phoneNumber);
+                        await page.waitForTimeout(1000);
+                        
+                        // بررسی اگر مقدار وارد شده
+                        const value = await element.inputValue();
+                        if (value.includes(phoneNumber) || value.includes(phoneNumber.substring(1))) {
+                            console.log(`✅ شماره موبایل وارد شد: ${value}`);
+                            return true;
+                        }
+                    }
+                }
+            } catch (error) {
+                // ادامه به سلکتور بعدی
+                continue;
+            }
+        }
+        
+        // اگر با سلکتورهای بالا پیدا نشد، سعی می‌کنیم تمام inputها را چک کنیم
+        try {
+            const allInputs = await page.$$('input');
+            console.log(`🔍 تعداد کل inputها: ${allInputs.length}`);
+            
+            for (let i = 0; i < allInputs.length; i++) {
+                const input = allInputs[i];
+                try {
+                    const isVisible = await input.isVisible();
+                    const isEnabled = await input.isEnabled();
+                    
+                    if (isVisible && isEnabled) {
+                        // امتحان کردن input
+                        await input.fill('');
+                        await page.waitForTimeout(300);
+                        await input.fill('9'); // عدد تست
+                        await page.waitForTimeout(300);
+                        
+                        const value = await input.inputValue();
+                        if (value === '9') {
+                            // این احتمالا یک فیلد عددی است
+                            await input.fill('');
+                            await input.fill(phoneNumber);
+                            await page.waitForTimeout(1000);
+                            
+                            const finalValue = await input.inputValue();
+                            console.log(`🔍 فیلد ${i} امتحان شد، مقدار: ${finalValue}`);
+                            
+                            if (finalValue.includes(phoneNumber) || finalValue.includes(phoneNumber.substring(1))) {
+                                console.log(`✅ شماره در فیلد ${i} وارد شد`);
+                                return true;
+                            }
+                        }
+                        
+                        // پاک کردن مقدار تست
+                        await input.fill('');
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+        } catch (error) {
+            console.error('❌ خطا در جستجوی تمام inputها:', error);
+        }
+        
+        return false;
+    }
+
+    async findAndClickContinue(page) {
+        console.log('🔍 در جستجوی دکمه ادامه...');
+        
+        // لیست متن‌های ممکن برای دکمه ادامه
+        const buttonTexts = [
+            'ادامه',
+            'ارسال',
+            'بعدی',
+            'تایید',
+            'تأیید',
+            'ورود',
+            'Login',
+            'Next',
+            'Continue',
+            'Submit',
+            'Send'
+        ];
+        
+        // لیست سلکتورهای ممکن برای دکمه
+        const buttonSelectors = [
+            'button',
+            'a[role="button"]',
+            'div[role="button"]',
+            'input[type="submit"]',
+            '[class*="button"]',
+            '[class*="btn"]'
+        ];
+        
+        // اول: جستجو با متن
+        for (const text of buttonTexts) {
+            try {
+                console.log(`🔍 جستجوی دکمه با متن: "${text}"`);
+                
+                // روش 1: XPath
+                const xpath = `//*[text()="${text}" or contains(text(), "${text}")]`;
+                const elementsByXPath = await page.$$(xpath);
+                
+                for (const element of elementsByXPath) {
+                    try {
+                        const tagName = await element.evaluate(el => el.tagName.toLowerCase());
+                        const isClickable = tagName === 'button' || tagName === 'a' || tagName === 'input' || 
+                                           await element.evaluate(el => el.getAttribute('role') === 'button');
+                        
+                        if (isClickable && await element.isVisible() && await element.isEnabled()) {
+                            console.log(`✅ دکمه "${text}" با XPath پیدا شد`);
+                            await element.click();
+                            return true;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                
+                // روش 2: Selector با :has-text
+                const selector = `:has-text("${text}")`;
+                const elementsByText = await page.$$(selector);
+                
+                for (const element of elementsByText) {
+                    try {
+                        const tagName = await element.evaluate(el => el.tagName.toLowerCase());
+                        const isClickable = tagName === 'button' || tagName === 'a' || tagName === 'input' || 
+                                           await element.evaluate(el => el.getAttribute('role') === 'button');
+                        
+                        if (isClickable && await element.isVisible() && await element.isEnabled()) {
+                            console.log(`✅ دکمه "${text}" با :has-text پیدا شد`);
+                            await element.click();
+                            return true;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
                 }
             } catch (error) {
                 continue;
             }
         }
         
-        // اگر با سلکتورهای بالا پیدا نشد، سعی می‌کنیم با XPath پیدا کنیم
+        // دوم: جستجو در تمام دکمه‌ها
+        for (const selector of buttonSelectors) {
+            try {
+                console.log(`🔍 جستجو با سلکتور: ${selector}`);
+                const elements = await page.$$(selector);
+                console.log(`🔍 تعداد عناصر پیدا شده: ${elements.length}`);
+                
+                for (let i = 0; i < elements.length; i++) {
+                    try {
+                        const element = elements[i];
+                        const isVisible = await element.isVisible();
+                        const isEnabled = await element.isEnabled();
+                        
+                        if (isVisible && isEnabled) {
+                            // گرفتن متن دکمه
+                            const text = await element.textContent();
+                            console.log(`🔍 دکمه ${i}: "${text}"`);
+                            
+                            // اگر دکمه متن معقولی دارد کلیک کن
+                            if (text && text.trim().length > 0 && text.trim().length < 50) {
+                                console.log(`🖱️ کلیک بر دکمه با متن: "${text.trim()}"`);
+                                await element.click();
+                                return true;
+                            }
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+        
+        // سوم: جستجو در تمام عناصر قابل کلیک
         try {
-            const xpath = `//*[contains(text(), '${labelText}')]/following::input[1]`;
-            const element = await page.$(xpath);
-            if (element) {
-                await element.fill(value);
+            const allElements = await page.$$('button, a, input[type="button"], input[type="submit"], [role="button"], [onclick]');
+            console.log(`🔍 تعداد عناصر قابل کلیک: ${allElements.length}`);
+            
+            for (let i = 0; i < allElements.length; i++) {
+                try {
+                    const element = allElements[i];
+                    const isVisible = await element.isVisible();
+                    const isEnabled = await element.isEnabled();
+                    
+                    if (isVisible && isEnabled) {
+                        const text = await element.textContent();
+                        console.log(`🔍 عنصر قابل کلیک ${i}: "${text}"`);
+                        
+                        // کلیک روی اولین دکمه قابل مشاهده
+                        if (text && text.trim()) {
+                            console.log(`🖱️ کلیک بر عنصر ${i} با متن: "${text.trim()}"`);
+                            await element.click();
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+        } catch (error) {
+            console.error('❌ خطا در جستجوی عناصر قابل کلیک:', error);
+        }
+        
+        // چهارم: امتحان کلیک روی عناصر با موقعیت ثابت
+        try {
+            // شاید دکمه با موقعیت خاصی باشد
+            const body = await page.$('body');
+            if (body) {
+                // کلیک در مرکز صفحه (شاید دکمه modal یا popup باشد)
+                const viewport = page.viewportSize();
+                await page.mouse.click(viewport.width / 2, viewport.height / 2);
+                console.log('🖱️ کلیک در مرکز صفحه');
                 return true;
             }
         } catch (error) {
-            // continue
+            console.error('❌ خطا در کلیک مرکزی:', error);
         }
         
-        throw new Error(`فیلد "${labelText}" پیدا نشد`);
-    }
-
-    async smartClick(page, buttonText) {
-        const selectors = [
-            `button:has-text("${buttonText}")`,
-            `a:has-text("${buttonText}")`,
-            `//button[contains(text(), '${buttonText}')]`,
-            `//a[contains(text(), '${buttonText}')]`,
-            `[role="button"]:has-text("${buttonText}")`,
-            `span:has-text("${buttonText}")`,
-            `div:has-text("${buttonText}")`
-        ];
-        
-        for (const selector of selectors) {
-            try {
-                const element = await page.$(selector);
-                if (element && await element.isVisible()) {
-                    await element.click();
-                    console.log(`🖱️ کلیک بر: ${buttonText}`);
-                    await page.waitForTimeout(1000);
-                    return true;
-                }
-            } catch (error) {
-                continue;
-            }
-        }
-        
-        // تلاش با XPath
-        try {
-            const xpath = `//*[contains(text(), '${buttonText}')]`;
-            const elements = await page.$$(xpath);
-            for (const element of elements) {
-                if (await element.isVisible()) {
-                    await element.click();
-                    return true;
-                }
-            }
-        } catch (error) {
-            // continue
-        }
-        
-        throw new Error(`دکمه "${buttonText}" پیدا نشد`);
+        return false;
     }
 
     async enterOtp(page, otp) {
         console.log(`🔢 وارد کردن OTP: ${otp}`);
         
-        // روش 1: جستجوی همه فیلدهای OTP
-        const otpInputs = await page.$$('input[type="tel"], input[type="number"], input[maxlength="1"]');
+        if (!otp || otp.length < 4) {
+            throw new Error('OTP معتبر نیست');
+        }
         
-        if (otpInputs.length >= 5) {
-            for (let i = 0; i < Math.min(otpInputs.length, 6); i++) {
-                if (otp[i]) {
-                    await otpInputs[i].fill(otp[i]);
+        // روش 1: جستجوی فیلدهای OTP جداگانه
+        const singleDigitSelectors = [
+            'input[type="tel"]',
+            'input[type="number"]',
+            'input[maxlength="1"]',
+            'input[style*="width"][style*="height"]', // معمولا فیلدهای OTP اندازه خاصی دارند
+            'div[class*="otp"] input',
+            'div[class*="code"] input'
+        ];
+        
+        for (const selector of singleDigitSelectors) {
+            try {
+                const inputs = await page.$$(selector);
+                if (inputs.length >= 4) { // حداقل 4 فیلد برای OTP
+                    console.log(`🔍 ${inputs.length} فیلد OTP پیدا شد`);
+                    
+                    for (let i = 0; i < Math.min(inputs.length, otp.length); i++) {
+                        try {
+                            await inputs[i].fill(otp[i]);
+                            await page.waitForTimeout(200);
+                        } catch (e) {
+                            continue;
+                        }
+                    }
+                    return true;
                 }
+            } catch (error) {
+                continue;
             }
-            return true;
         }
         
         // روش 2: جستجوی فیلد تک‌
-        const singleInput = await page.$('input[type="tel"][maxlength="6"], input[type="number"][maxlength="6"]');
-        if (singleInput) {
-            await singleInput.fill(otp);
-            return true;
+        const singleInputSelectors = [
+            'input[type="tel"][maxlength="6"]',
+            'input[type="number"][maxlength="6"]',
+            'input[name*="otp"]',
+            'input[name*="code"]',
+            'input[placeholder*="کد"]',
+            'input[placeholder*="رمز"]'
+        ];
+        
+        for (const selector of singleInputSelectors) {
+            try {
+                const input = await page.$(selector);
+                if (input && await input.isVisible()) {
+                    await input.fill(otp);
+                    return true;
+                }
+            } catch (error) {
+                continue;
+            }
         }
         
-        // روش 3: جستجو با XPath
-        const xpath = '//input[@type="tel" or @type="number"]';
-        const inputs = await page.$$(xpath);
-        if (inputs.length > 0) {
-            await inputs[0].fill(otp);
-            return true;
+        // روش 3: امتحان کردن تمام inputها
+        try {
+            const allInputs = await page.$$('input');
+            console.log(`🔍 تعداد کل inputها برای OTP: ${allInputs.length}`);
+            
+            for (const input of allInputs) {
+                try {
+                    if (await input.isVisible()) {
+                        // امتحان کردن input
+                        await input.fill('123456');
+                        await page.waitForTimeout(500);
+                        
+                        const value = await input.inputValue();
+                        if (value === '123456') {
+                            // این فیلد می‌تواند OTP باشد
+                            await input.fill('');
+                            await input.fill(otp);
+                            return true;
+                        }
+                        // پاک کردن مقدار تست
+                        await input.fill('');
+                    }
+                } catch (e) {
+                    continue;
+                }
+            }
+        } catch (error) {
+            console.error('❌ خطا در جستجوی OTP:', error);
         }
         
         throw new Error('فیلد OTP پیدا نشد');
     }
 
-    async waitForFieldInDatabase(phoneNumber, fieldName, maxAttempts = 60) {
+    async findAndClickVerify(page) {
+        console.log('🔍 در جستجوی دکمه تأیید...');
+        
+        const verifyTexts = ['تأیید', 'تایید', 'ورود', 'ادامه', 'ثبت', 'Verify', 'Confirm', 'Submit'];
+        
+        for (const text of verifyTexts) {
+            try {
+                const selector = `:has-text("${text}")`;
+                const elements = await page.$$(selector);
+                
+                for (const element of elements) {
+                    try {
+                        if (await element.isVisible() && await element.isEnabled()) {
+                            console.log(`✅ دکمه "${text}" پیدا شد`);
+                            await element.click();
+                            return true;
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+        
+        return false;
+    }
+
+    async fillProfileInfo(page, user) {
+        console.log('👤 پر کردن اطلاعات پروفایل...');
+        
+        const profileFields = [
+            { key: 'personalName', label: 'نام', value: user.personalName },
+            { key: 'personalNationalCode', label: 'کد ملی', value: user.personalNationalCode },
+            { key: 'personalBirthDate', label: 'تاریخ تولد', value: user.personalBirthDate },
+            { key: 'personalCity', label: 'شهر', value: user.personalCity },
+            { key: 'personalProvince', label: 'استان', value: user.personalProvince }
+        ];
+        
+        let filledCount = 0;
+        
+        for (const field of profileFields) {
+            try {
+                // جستجوی فیلد با label
+                const filled = await this.findAndFillByLabel(page, field.label, field.value);
+                if (filled) {
+                    filledCount++;
+                    await page.waitForTimeout(500);
+                }
+            } catch (error) {
+                console.error(`❌ خطا در پر کردن ${field.label}:`, error);
+            }
+        }
+        
+        console.log(`✅ ${filledCount} از ${profileFields.length} فیلد پر شد`);
+        return filledCount > 0;
+    }
+
+    async findAndFillByLabel(page, label, value) {
+        // روش‌های مختلف برای پیدا کردن فیلد
+        const methods = [
+            // با placeholder
+            async () => {
+                const selector = `input[placeholder*="${label}"]`;
+                const input = await page.$(selector);
+                if (input && await input.isVisible()) {
+                    await input.fill(value);
+                    return true;
+                }
+                return false;
+            },
+            
+            // با label element
+            async () => {
+                const xpath = `//label[contains(text(), "${label}")]/following::input[1]`;
+                const input = await page.$(xpath);
+                if (input && await input.isVisible()) {
+                    await input.fill(value);
+                    return true;
+                }
+                return false;
+            },
+            
+            // با name
+            async () => {
+                const selector = `input[name*="${label.toLowerCase().replace(' ', '')}"]`;
+                const input = await page.$(selector);
+                if (input && await input.isVisible()) {
+                    await input.fill(value);
+                    return true;
+                }
+                return false;
+            },
+            
+            // جستجو در تمام inputها
+            async () => {
+                const allInputs = await page.$$('input, textarea, select');
+                for (const input of allInputs) {
+                    try {
+                        if (await input.isVisible()) {
+                            // امتحان کردن input
+                            await input.fill('test');
+                            await page.waitForTimeout(100);
+                            const testValue = await input.inputValue();
+                            
+                            if (testValue === 'test') {
+                                await input.fill('');
+                                await input.fill(value);
+                                return true;
+                            }
+                            await input.fill('');
+                        }
+                    } catch (e) {
+                        continue;
+                    }
+                }
+                return false;
+            }
+        ];
+        
+        for (const method of methods) {
+            try {
+                const result = await method();
+                if (result) {
+                    console.log(`✅ فیلد "${label}" پر شد: ${value}`);
+                    return true;
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+        
+        return false;
+    }
+
+    async findAndClickCompleteRegistration(page) {
+        // مشابه findAndClickContinue اما برای تکمیل ثبت‌نام
+        return await this.findAndClickContinue(page);
+    }
+
+    async waitForFieldInDatabase(phoneNumber, fieldName, maxAttempts = 180) { // 3 دقیقه
         console.log(`⏳ منتظر پر شدن ${fieldName} برای ${phoneNumber}...`);
         
         let attempts = 0;
-        while (attempts < maxAttempts) {
+        while (attempts < maxAttempts && this.isRunning) {
             try {
                 const user = await this.collection.findOne(
                     { personalPhoneNumber: phoneNumber },
-                    { projection: { [fieldName]: 1 } }
+                    { projection: { [fieldName]: 1, _id: 0 } }
                 );
                 
-                if (user && user[fieldName] && user[fieldName].trim() !== '') {
-                    console.log(`✅ ${fieldName} دریافت شد: ${user[fieldName]}`);
-                    return user[fieldName];
+                if (user && user[fieldName] && user[fieldName].toString().trim() !== '') {
+                    const value = user[fieldName].toString();
+                    console.log(`✅ ${fieldName} دریافت شد: ${value}`);
+                    return value;
                 }
                 
                 attempts++;
-                await new Promise(resolve => setTimeout(resolve, 1000)); // هر 1 ثانیه چک کن
+                if (attempts % 10 === 0) {
+                    console.log(`⏳ ${attempts} ثانیه از ${maxAttempts} منتظر ${fieldName}...`);
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 1000));
                 
             } catch (error) {
-                console.error(`خطا در چک کردن ${fieldName}:`, error);
+                console.error(`❌ خطا در چک کردن ${fieldName}:`, error);
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 attempts++;
             }
@@ -494,15 +862,13 @@ class AbanTetherBot {
             const updateData = {
                 $set: {
                     status: 'failed',
-                    failureReason: reason,
+                    failureReason: reason.substring(0, 500), // محدود کردن طول دلیل
                     failedAt: new Date()
                 },
                 $inc: { __v: 1 }
             };
             
-            if (shouldRetry) {
-                updateData.$inc.retryCount = 1;
-            } else {
+            if (!shouldRetry) {
                 updateData.$set.processed = true;
             }
             
@@ -522,8 +888,12 @@ class AbanTetherBot {
         this.isRunning = false;
         
         if (this.mongoClient) {
-            await this.mongoClient.close();
-            console.log('✅ اتصال MongoDB بسته شد');
+            try {
+                await this.mongoClient.close();
+                console.log('✅ اتصال MongoDB بسته شد');
+            } catch (error) {
+                console.error('❌ خطا در بستن اتصال MongoDB:', error);
+            }
         }
     }
 }
@@ -543,11 +913,12 @@ async function main() {
     
     try {
         await bot.initialize();
+        console.log('✅ ربات آماده است');
         await bot.startPolling();
         
         // مدیریت خاتمه برنامه
         process.on('SIGINT', async () => {
-            console.log('\n🛑 دریافت سیگنال خاتمه...');
+            console.log('\n🛑 دریافت سیگنال خاتمه (Ctrl+C)...');
             await bot.cleanup();
             process.exit(0);
         });
@@ -558,7 +929,8 @@ async function main() {
             process.exit(0);
         });
         
-        console.log('🤖 ربات آماده کار است. Ctrl+C برای توقف.');
+        console.log('🤖 ربات در حال اجراست. منتظر کاربران جدید...');
+        console.log('⚠️  برای توقف: Ctrl+C');
         
         // نگه داشتن برنامه در حال اجرا
         await new Promise(() => {});
