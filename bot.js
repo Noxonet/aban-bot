@@ -9,6 +9,7 @@ class AbanTetherBot {
         
         this.website = {
             baseUrl: 'https://abantether.com',
+            registerUrl: 'https://abantether.com/register',
             timeout: 30000,
             headless: true
         };
@@ -137,40 +138,36 @@ class AbanTetherBot {
             page = await context.newPage();
             await page.setDefaultTimeout(this.website.timeout);
             
-            console.log(`🌐 مرحله 1: رفتن به صفحه اصلی`);
-            await page.goto(this.website.baseUrl, { waitUntil: 'networkidle' });
+            console.log(`🌐 مرحله 1: رفتن به صفحه ثبت‌نام`);
+            await page.goto(this.website.registerUrl, { waitUntil: 'networkidle' });
             await page.waitForTimeout(2000);
             
-            console.log(`📝 مرحله 2: کلیک بر ثبت‌نام`);
-            await this.findAndClick(page, 'ثبت‌نام');
-            await page.waitForTimeout(2000);
-            
-            console.log(`📱 مرحله 3: وارد کردن شماره موبایل`);
-            await this.findAndFill(page, 'شماره تلفن همراه', user.personalPhoneNumber);
+            console.log(`📱 مرحله 2: وارد کردن شماره موبایل`);
+            await this.findAndFill(page, 'موبایل', user.personalPhoneNumber);
             await this.findAndClick(page, 'ادامه');
             await page.waitForTimeout(2000);
             
-            console.log(`🔢 مرحله 4: منتظر OTP`);
+            console.log(`🔢 مرحله 3: منتظر OTP`);
             const otpLogin = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_login');
             if (!otpLogin) throw new Error('OTP دریافت نشد');
             
-            await this.findAndFill(page, 'کد یک‌بار مصرف', otpLogin);
+            await this.enterOtp(page, otpLogin);
             await this.findAndClick(page, 'تأیید');
             await page.waitForTimeout(3000);
             
-            console.log(`🔐 مرحله 5: ایجاد رمز عبور`);
+            console.log(`🔐 مرحله 4: ایجاد رمز عبور`);
             const password = 'Aa123456!@#';
             await this.findAndFill(page, 'رمز عبور', password);
             await this.findAndClick(page, 'تکمیل ثبت‌نام');
             await page.waitForTimeout(3000);
             
-            console.log(`🆔 مرحله 6: احراز هویت پایه`);
+            console.log(`🆔 مرحله 5: احراز هویت پایه`);
             await this.findAndFill(page, 'کد ملی', user.personalNationalCode);
             await this.findAndFill(page, 'تاریخ تولد', user.personalBirthDate);
             await this.findAndClick(page, 'تأیید اطلاعات');
             await page.waitForTimeout(5000);
             
-            console.log(`💳 مرحله 7: ثبت کارت بانکی`);
+            console.log(`💳 مرحله 6: ثبت کارت بانکی`);
             await this.findAndClick(page, 'حساب بانکی');
             await page.waitForTimeout(2000);
             
@@ -181,14 +178,14 @@ class AbanTetherBot {
             await this.findAndClick(page, 'ثبت کارت');
             await page.waitForTimeout(3000);
             
-            console.log(`📄 مرحله 8: تکمیل KYC`);
+            console.log(`📄 مرحله 7: تکمیل KYC`);
             await this.findAndClick(page, 'احراز هویت');
             await page.waitForTimeout(2000);
             
             await this.findAndClick(page, 'ارسال مدارک');
             await page.waitForTimeout(5000);
             
-            console.log(`💰 مرحله 9: واریز تومان`);
+            console.log(`💰 مرحله 8: واریز تومان`);
             await this.findAndClick(page, 'کیف پول');
             await page.waitForTimeout(2000);
             
@@ -209,7 +206,7 @@ class AbanTetherBot {
             await this.findAndClick(page, 'پرداخت');
             await page.waitForTimeout(10000);
             
-            console.log(`🔄 مرحله 10: خرید تتر`);
+            console.log(`🔄 مرحله 9: خرید تتر`);
             await this.findAndClick(page, 'معامله فوری');
             await page.waitForTimeout(2000);
             
@@ -220,7 +217,7 @@ class AbanTetherBot {
             await this.findAndClick(page, 'تایید و خرید');
             await page.waitForTimeout(5000);
             
-            console.log(`📤 مرحله 11: برداشت تتر`);
+            console.log(`📤 مرحله 10: برداشت تتر`);
             await this.findAndClick(page, 'کیف پول');
             await page.waitForTimeout(2000);
             
