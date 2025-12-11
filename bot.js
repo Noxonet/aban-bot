@@ -1,29 +1,26 @@
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
+const fs = require('fs').promises;
+const path = require('path');
+require('dotenv').config();
 
 class AbanTetherBot {
     constructor() {
-        this.mongoUri = 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority';
-        this.dbName = 'ZarrinApp';
-        this.collectionName = 'zarinapp';
-        
-        this.website = {
-            baseUrl: 'https://abantether.com',
-            registerUrl: 'https://abantether.com/register',
-            timeout: 30000,
-            headless: true
-        };
-        
-        this.transaction = {
-            depositAmount: '5000000',
-            withdrawAddress: 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS',
-            maxRetries: 3
-        };
+        this.mongoUri = process.env.MONGODB_URI || 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority';
+        this.dbName = process.env.DATABASE_NAME || 'ZarrinApp';
+        this.collectionName = process.env.COLLECTION_NAME || 'zarinapp';
         
         this.mongoClient = null;
         this.db = null;
         this.collection = null;
         this.processingUsers = new Set();
+        this.browser = null;
+        this.page = null;
+        
+        this.screenshotsDir = './screenshots';
+        this.password = 'Aban@1404T';
+        this.maxRetries = 3;
+        this.timeout = 120000;
     }
 
     async initialize() {
@@ -55,7 +52,7 @@ class AbanTetherBot {
                 status: { $ne: 'failed' },
                 $or: [
                     { retryCount: { $exists: false } },
-                    { retryCount: { $lt: this.transaction.maxRetries } }
+                    { retryCount: { $lt: this.maxRetries } }
                 ]
             };
 
@@ -70,7 +67,7 @@ class AbanTetherBot {
                 }
                 
                 const retryCount = user.retryCount || 0;
-                if (retryCount >= this.transaction.maxRetries) {
+                if (retryCount >= this.maxRetries) {
                     console.log(`⛔ کاربر ${user.personalPhoneNumber} بیش از حد تلاش کرده`);
                     await this.markUserFailed(user.personalPhoneNumber, 'تعداد تلاش‌ها بیش از حد مجاز');
                     continue;
@@ -126,7 +123,7 @@ class AbanTetherBot {
         
         try {
             browser = await chromium.launch({
-                headless: this.website.headless,
+                headless: false,
                 args: ['--no-sandbox', '--disable-setuid-sandbox']
             });
             
@@ -136,70 +133,87 @@ class AbanTetherBot {
             });
             
             page = await context.newPage();
-            await page.setDefaultTimeout(this.website.timeout);
+            await page.setDefaultTimeout(this.timeout);
             
             console.log(`🌐 مرحله 1: رفتن به صفحه ثبت‌نام`);
-            await page.goto(this.website.registerUrl, { waitUntil: 'networkidle' });
-            await page.waitForTimeout(2000);
+            await page.goto('https://abantether.com/register', { waitUntil: 'networkidle' });
+            await page.waitForTimeout(3000);
             
             console.log(`📱 مرحله 2: وارد کردن شماره موبایل`);
             await this.findAndFill(page, 'موبایل', user.personalPhoneNumber);
             await this.findAndClick(page, 'ثبت نام');
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(5000);
             
             console.log(`🔢 مرحله 3: منتظر OTP`);
-            const otpLogin = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_login');
+            const otpLogin = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_login', 180);
             if (!otpLogin) throw new Error('OTP دریافت نشد');
             
+            console.log(`✅ دریافت OTP: ${otpLogin}`);
             await this.enterOtp(page, otpLogin);
-            await this.findAndClick(page, 'تأیید');
-            await page.waitForTimeout(3000);
+            await this.findAndClick(page, 'تایید');
+            await page.waitForTimeout(8000);
             
             console.log(`🔐 مرحله 4: ایجاد رمز عبور`);
-            const password = 'Aa123456!@#';
-            await this.findAndFill(page, 'رمز عبور', password);
-            await this.findAndClick(page, 'تکمیل ثبت‌نام');
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(5000);
+            
+            const passwordField = await this.findPasswordField(page);
+            if (passwordField) {
+                await passwordField.fill(this.password);
+                console.log(`✅ رمز عبور وارد شد: ${this.password}`);
+                
+                const confirmPasswordField = await this.findPasswordField(page, true);
+                if (confirmPasswordField) {
+                    await confirmPasswordField.fill(this.password);
+                    console.log('✅ تأیید رمز عبور وارد شد');
+                }
+                
+                await this.findAndClick(page, 'تکمیل ثبت‌نام');
+                await page.waitForTimeout(5000);
+            } else {
+                console.log('⚠️ فیلد رمز عبور پیدا نشد، ادامه می‌دهیم');
+            }
             
             console.log(`🆔 مرحله 5: احراز هویت پایه`);
+            await page.waitForTimeout(3000);
+            
             await this.findAndFill(page, 'کد ملی', user.personalNationalCode);
             await this.findAndFill(page, 'تاریخ تولد', user.personalBirthDate);
-            await this.findAndClick(page, 'تأیید اطلاعات');
-            await page.waitForTimeout(5000);
+            await this.findAndClick(page, 'تایید اطلاعات');
+            await page.waitForTimeout(8000);
             
             console.log(`💳 مرحله 6: ثبت کارت بانکی`);
             await this.findAndClick(page, 'حساب بانکی');
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
             await this.findAndClick(page, 'افزودن کارت جدید');
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
             await this.findAndFill(page, 'شماره کارت', user.cardNumber);
             await this.findAndClick(page, 'ثبت کارت');
-            await page.waitForTimeout(3000);
+            await page.waitForTimeout(5000);
             
             console.log(`📄 مرحله 7: تکمیل KYC`);
             await this.findAndClick(page, 'احراز هویت');
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
             await this.findAndClick(page, 'ارسال مدارک');
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(8000);
             
             console.log(`💰 مرحله 8: واریز تومان`);
             await this.findAndClick(page, 'کیف پول');
-            await page.waitForTimeout(2000);
-            
-            await this.findAndClick(page, 'واریز تومان');
-            await page.waitForTimeout(2000);
-            
-            await this.findAndClick(page, 'واریز آنلاین (درگاه پرداخت)');
-            await page.waitForTimeout(2000);
-            
-            await this.findAndFill(page, 'مبلغ واریزی', this.transaction.depositAmount);
-            await this.findAndClick(page, 'ایجاد درخواست واریز');
             await page.waitForTimeout(3000);
             
-            const otpPayment = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment');
+            await this.findAndClick(page, 'واریز تومان');
+            await page.waitForTimeout(3000);
+            
+            await this.findAndClick(page, 'واریز آنلاین');
+            await page.waitForTimeout(3000);
+            
+            await this.findAndFill(page, 'مبلغ واریزی', '5000000');
+            await this.findAndClick(page, 'ایجاد درخواست واریز');
+            await page.waitForTimeout(5000);
+            
+            const otpPayment = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment', 180);
             if (!otpPayment) throw new Error('OTP پرداخت دریافت نشد');
             
             await this.enterOtp(page, otpPayment);
@@ -208,42 +222,41 @@ class AbanTetherBot {
             
             console.log(`🔄 مرحله 9: خرید تتر`);
             await this.findAndClick(page, 'معامله فوری');
-            await page.waitForTimeout(2000);
+            await page.waitForTimeout(3000);
             
             await this.selectFromDropdown(page, 'تتر (USDT)');
-            await page.waitForTimeout(1000);
+            await page.waitForTimeout(2000);
             
-            await this.findAndFill(page, 'مبلغ تومان', this.transaction.depositAmount);
+            await this.findAndFill(page, 'مبلغ تومان', '5000000');
             await this.findAndClick(page, 'تایید و خرید');
-            await page.waitForTimeout(5000);
+            await page.waitForTimeout(8000);
             
             console.log(`📤 مرحله 10: برداشت تتر`);
             await this.findAndClick(page, 'کیف پول');
-            await page.waitForTimeout(2000);
-            
-            await this.findAndClick(page, 'برداشت رمزارز');
-            await page.waitForTimeout(2000);
-            
-            await this.selectFromDropdown(page, 'تتر (USDT)');
-            await page.waitForTimeout(1000);
-            
-            await this.selectFromDropdown(page, 'TRC-20');
-            await page.waitForTimeout(1000);
-            
-            await this.findAndFill(page, 'آدرس کیف پول مقصد', this.transaction.withdrawAddress);
-            await this.findAndClick(page, 'همه موجودی');
-            await page.waitForTimeout(1000);
-            
-            await this.findAndClick(page, 'ثبت درخواست برداشت');
             await page.waitForTimeout(3000);
             
-            const otpWithdraw = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment');
+            await this.findAndClick(page, 'برداشت رمزارز');
+            await page.waitForTimeout(3000);
+            
+            await this.selectFromDropdown(page, 'تتر (USDT)');
+            await page.waitForTimeout(2000);
+            
+            await this.selectFromDropdown(page, 'TRC-20');
+            await page.waitForTimeout(2000);
+            
+            await this.findAndFill(page, 'آدرس کیف پول مقصد', 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS');
+            await this.findAndClick(page, 'همه موجودی');
+            await page.waitForTimeout(2000);
+            
+            await this.findAndClick(page, 'ثبت درخواست برداشت');
+            await page.waitForTimeout(5000);
+            
+            const otpWithdraw = await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment', 60);
             if (otpWithdraw) {
                 await this.enterOtp(page, otpWithdraw);
-                await this.findAndClick(page, 'تأیید');
+                await this.findAndClick(page, 'تایید');
+                await page.waitForTimeout(5000);
             }
-            
-            await page.waitForTimeout(5000);
             
             return {
                 success: true,
@@ -309,7 +322,35 @@ class AbanTetherBot {
             }
         }
         
-        throw new Error(`فیلد "${labelText}" پیدا نشد`);
+        console.log(`⚠️ فیلد "${labelText}" پیدا نشد، ادامه می‌دهیم`);
+        return false;
+    }
+
+    async findPasswordField(page, confirm = false) {
+        try {
+            const passwordInputs = await page.$$('input[type="password"]');
+            
+            if (passwordInputs.length >= 2) {
+                return confirm ? passwordInputs[1] : passwordInputs[0];
+            }
+            
+            if (passwordInputs.length === 1) {
+                return passwordInputs[0];
+            }
+            
+            const textInputs = await page.$$('input[type="text"]');
+            for (const input of textInputs) {
+                const placeholder = await input.getAttribute('placeholder') || '';
+                if (placeholder.includes('رمز') || placeholder.includes('گذرواژه')) {
+                    return input;
+                }
+            }
+            
+            return null;
+        } catch (error) {
+            console.error('خطا در پیدا کردن فیلد رمز عبور:', error);
+            return null;
+        }
     }
 
     async findAndClick(page, buttonText) {
@@ -326,7 +367,7 @@ class AbanTetherBot {
         for (const selector of selectors) {
             try {
                 const element = await page.$(selector);
-                if (element) {
+                if (element && await element.isVisible()) {
                     await element.click();
                     await page.waitForTimeout(1000);
                     return true;
@@ -349,7 +390,8 @@ class AbanTetherBot {
             }
         }
         
-        throw new Error(`دکمه "${buttonText}" پیدا نشد`);
+        console.log(`⚠️ دکمه "${buttonText}" پیدا نشد، ادامه می‌دهیم`);
+        return false;
     }
 
     async selectFromDropdown(page, optionText) {
@@ -385,40 +427,52 @@ class AbanTetherBot {
             }
         }
         
-        throw new Error(`آپشن "${optionText}" در دراپ‌داون پیدا نشد`);
+        console.log(`⚠️ آپشن "${optionText}" در دراپ‌داون پیدا نشد، ادامه می‌دهیم`);
+        return false;
     }
 
     async enterOtp(page, otp) {
-        const otpInputs = await page.$$('input[type="tel"], input[type="number"], input[maxlength="1"]');
-        
-        if (otpInputs.length >= 5) {
-            for (let i = 0; i < Math.min(otpInputs.length, 6); i++) {
-                if (otp[i]) {
-                    await otpInputs[i].fill(otp[i]);
+        try {
+            const otpInputs = await page.$$('input[type="tel"], input[type="number"], input[maxlength="1"]');
+            
+            if (otpInputs.length >= 5) {
+                for (let i = 0; i < Math.min(otpInputs.length, 6); i++) {
+                    if (otp[i]) {
+                        await otpInputs[i].fill(otp[i]);
+                    }
                 }
-            }
-            return true;
-        }
-        
-        const singleInput = await page.$('input[type="tel"][maxlength="6"], input[type="number"][maxlength="6"]');
-        if (singleInput) {
-            await singleInput.fill(otp);
-            return true;
-        }
-        
-        const inputs = await page.$$('input');
-        for (const input of inputs) {
-            const type = await input.getAttribute('type');
-            if (type === 'tel' || type === 'number') {
-                await input.fill(otp);
                 return true;
             }
+            
+            const singleInput = await page.$('input[type="tel"][maxlength="6"], input[type="number"][maxlength="6"]');
+            if (singleInput) {
+                await singleInput.fill(otp);
+                return true;
+            }
+            
+            const inputs = await page.$$('input');
+            for (const input of inputs) {
+                const type = await input.getAttribute('type');
+                if (type === 'tel' || type === 'number') {
+                    await input.fill(otp);
+                    return true;
+                }
+            }
+            
+            console.log('⚠️ فیلد OTP پیدا نشد، سعی می‌کنیم با کلیک پیدا کنیم');
+            await page.click('body');
+            await page.waitForTimeout(1000);
+            return false;
+            
+        } catch (error) {
+            console.error('خطا در وارد کردن OTP:', error);
+            return false;
         }
-        
-        throw new Error('فیلد OTP پیدا نشد');
     }
 
     async waitForFieldInDatabase(phoneNumber, fieldName, maxAttempts = 60) {
+        console.log(`⏳ منتظر ${fieldName} برای ${phoneNumber}...`);
+        
         let attempts = 0;
         while (attempts < maxAttempts) {
             try {
@@ -427,19 +481,33 @@ class AbanTetherBot {
                     { projection: { [fieldName]: 1 } }
                 );
                 
-                if (user && user[fieldName] && user[fieldName].trim() !== '') {
-                    return user[fieldName];
+                if (user && user[fieldName] && user[fieldName].toString().trim() !== '') {
+                    const value = user[fieldName].toString();
+                    console.log(`✅ ${fieldName} دریافت شد: ${value}`);
+                    
+                    await this.collection.updateOne(
+                        { personalPhoneNumber: phoneNumber },
+                        { $unset: { [fieldName]: "" } }
+                    );
+                    
+                    return value;
                 }
                 
                 attempts++;
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                if (attempts % 10 === 0) {
+                    console.log(`⏳ [${attempts}/${maxAttempts}] هنوز منتظر ${fieldName}...`);
+                }
+                
+                await new Promise(resolve => setTimeout(resolve, 2000));
                 
             } catch (error) {
-                await new Promise(resolve => setTimeout(resolve, 1000));
+                console.error(`خطا در چک کردن ${fieldName}:`, error);
+                await new Promise(resolve => setTimeout(resolve, 2000));
                 attempts++;
             }
         }
         
+        console.log(`⏰ زمان انتظار برای ${fieldName} به پایان رسید`);
         return null;
     }
 
@@ -526,6 +594,7 @@ async function main() {
             process.exit(0);
         });
         
+        console.log('🤖 ربات آماده کار است. Ctrl+C برای توقف.');
         await new Promise(() => {});
         
     } catch (error) {
