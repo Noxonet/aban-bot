@@ -144,7 +144,7 @@ class AbanTetherBot {
             
             console.log(`📱 مرحله 2: وارد کردن شماره موبایل`);
             await this.findAndFill(page, 'موبایل', user.personalPhoneNumber);
-            await this.findAndClick(page, 'ادامه');
+            await this.findAndClick(page, 'ثبت نام');
             await page.waitForTimeout(2000);
             
             console.log(`🔢 مرحله 3: منتظر OTP`);
