@@ -9,11 +9,17 @@
     "install-browser": "npx playwright install chromium",
     "test-db": "node -e \"const {MongoClient}=require('mongodb');async function t(){const c=new MongoClient('mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority');await c.connect();const db=c.db('ZarrinApp');const col=db.collection('zarinapp');const count=await col.countDocuments({otp_login:{\\$exists:true,\\$ne:null,\\$ne:''}});console.log('کاربران با OTP:',count);await c.close();}t().catch(console.error);\""
   },
-  "keywords": ["abantether", "bot", "automation", "crypto"],
+  "keywords": [
+    "abantether",
+    "bot",
+    "automation",
+    "crypto"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "playwright": "^1.40.0",
-    "mongodb": "^6.0.0"
+    "mongodb": "^6.21.0",
+    "playwright": "^1.57.0",
+    "tesseract.js": "^7.0.0"
   }
 }
