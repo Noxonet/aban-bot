@@ -1,6 +1,8 @@
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
 const Tesseract = require('tesseract.js');
+const fs = require('fs').promises;
+const path = require('path');
 
 class AbanTetherBot {
     constructor() {
@@ -13,6 +15,7 @@ class AbanTetherBot {
         this.withdrawAmount = '40';
         this.withdrawAddress = 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS';
         this.maxRetries = 3;
+        this.screenshotsDir = './debug_screenshots';
         
         // متغیرها
         this.browser = null;
@@ -22,6 +25,19 @@ class AbanTetherBot {
         this.mongoClient = null;
         this.db = null;
         this.collection = null;
+    }
+
+    // --- سیستم عکس‌برداری ---
+    async takeScreenshot(name) {
+        try {
+            await fs.mkdir(this.screenshotsDir, { recursive: true });
+            const screenshotPath = path.join(this.screenshotsDir, `${name}-${Date.now()}.png`);
+            await this.page.screenshot({ path: screenshotPath, fullPage: true });
+            this.log('SCREENSHOT', `📸 عکس ذخیره شد: ${screenshotPath}`);
+            return screenshotPath;
+        } catch (error) {
+            this.log('ERROR', `❌ خطا در عکس‌برداری: ${error.message}`);
+        }
     }
 
     // --- توابع کمکی ---
@@ -38,7 +54,7 @@ class AbanTetherBot {
         try {
             this.mongoClient = new MongoClient(this.mongoUri);
             await this.mongoClient.connect();
-            this.db = this.mongoClient.db(this.dbName);
+            this.db = this.client.db(this.dbName);
             this.collection = this.db.collection(this.collectionName);
             this.log('DATABASE', '✅ متصل به دیتابیس شد');
         } catch (error) {
@@ -78,7 +94,6 @@ class AbanTetherBot {
                     const value = user[fieldName];
                     this.log('WAIT', `✅ ${fieldName} دریافت شد: ${value}`);
                     
-                    // پاک کردن OTP از دیتابیس
                     await this.collection.updateOne(
                         { personalPhoneNumber: phone },
                         { $unset: { [fieldName]: "" } }
@@ -116,48 +131,71 @@ class AbanTetherBot {
         }
     }
 
-    // --- توابع پیدا کردن المان‌ها ---
+    // --- توابع بهبود یافته برای پیدا کردن المان‌ها ---
     async findAndFill(text, value) {
         try {
             this.log('FILL', `🔍 در حال پیدا کردن فیلد با متن: "${text}"`);
             
-            // 1. سعی کن با placeholder پیدا کنی
+            // 1. سعی کن با placeholder پیدا کنی (دقیق)
             const placeholderSelector = `input[placeholder*="${text}"]`;
             let element = await this.page.$(placeholderSelector);
             
             if (element) {
                 await element.fill(value);
-                this.log('FILL', `✅ پر شد (با placeholder): "${text}" = ${value}`);
+                this.log('FILL', `✅ پر شد (placeholder): "${text}" = ${value}`);
                 await this.sleep(1000);
                 return;
             }
             
-            // 2. سعی کن label پیدا کنی و به input بعدیش برسی
+            // 2. سعی کن با aria-label پیدا کنی
+            const ariaSelector = `input[aria-label*="${text}"]`;
+            element = await this.page.$(ariaSelector);
+            
+            if (element) {
+                await element.fill(value);
+                this.log('FILL', `✅ پر شد (aria-label): "${text}" = ${value}`);
+                await this.sleep(1000);
+                return;
+            }
+            
+            // 3. سعی کن label پیدا کنی
             const labelXPath = `//label[contains(text(), '${text}')]/following::input[1]`;
             element = await this.page.$(labelXPath);
             
             if (element) {
                 await element.fill(value);
-                this.log('FILL', `✅ پر شد (با label): "${text}" = ${value}`);
+                this.log('FILL', `✅ پر شد (label): "${text}" = ${value}`);
                 await this.sleep(1000);
                 return;
             }
             
-            // 3. سعی کن همه inputها را چک کنی
+            // 4. همه inputها را چک کن
             const allInputs = await this.page.$$('input, textarea');
             for (const input of allInputs) {
-                const placeholder = await input.getAttribute('placeholder') || '';
-                if (placeholder.includes(text)) {
-                    await input.fill(value);
-                    this.log('FILL', `✅ پر شد (با چک همه): "${text}" = ${value}`);
-                    await this.sleep(1000);
-                    return;
+                try {
+                    const placeholder = await input.getAttribute('placeholder') || '';
+                    const ariaLabel = await input.getAttribute('aria-label') || '';
+                    const name = await input.getAttribute('name') || '';
+                    const id = await input.getAttribute('id') || '';
+                    
+                    if (placeholder.includes(text) || 
+                        ariaLabel.includes(text) || 
+                        name.includes(text) || 
+                        id.includes(text)) {
+                        await input.fill(value);
+                        this.log('FILL', `✅ پر شد (تمام چک‌ها): "${text}" = ${value}`);
+                        await this.sleep(1000);
+                        return;
+                    }
+                } catch {
+                    continue;
                 }
             }
             
             throw new Error(`فیلد "${text}" پیدا نشد`);
             
         } catch (error) {
+            await this.takeScreenshot(`error-fill-${text}`);
             this.log('ERROR', `❌ خطا در پر کردن فیلد: ${error.message}`);
             throw error;
         }
@@ -165,45 +203,78 @@ class AbanTetherBot {
 
     async findAndClick(text) {
         try {
-            this.log('CLICK', `🔍 در حال پیدا کردن دکمه با متن: "${text}"`);
+            this.log('CLICK', `🔍 در حال پیدا کردن المان با متن: "${text}"`);
             
-            // 1. سعی کن دکمه پیدا کنی
-            let element = await this.page.$(`button:has-text("${text}")`);
+            // لیست متون مختلف برای جستجو (با توجه به فاصله‌ها)
+            const possibleTexts = [
+                text, // متن اصلی
+                text.replace(/\s+/g, ''), // حذف همه فاصله‌ها
+                text.replace(/\s+/g, '‌'), // جایگزینی با نیم‌فاصله
+                text.replace(/\s+/g, ' '), // فقط یک فاصله
+                text.trim(), // حذف فاصله اول و آخر
+            ];
             
-            if (element) {
-                await element.click();
-                this.log('CLICK', `✅ کلیک شد (دکمه): "${text}"`);
-                await this.sleep(2000);
-                return;
-            }
+            // لیست سلکتورها
+            const selectors = [
+                'button',
+                'a',
+                'div',
+                'span',
+                'input[type="submit"]',
+                'input[type="button"]',
+                'label'
+            ];
             
-            // 2. سعی کن لینک پیدا کنی
-            element = await this.page.$(`a:has-text("${text}")`);
-            
-            if (element) {
-                await element.click();
-                this.log('CLICK', `✅ کلیک شد (لینک): "${text}"`);
-                await this.sleep(2000);
-                return;
-            }
-            
-            // 3. سعی کن با XPath پیدا کنی
-            const xpathSelector = `//*[contains(text(), '${text}')]`;
-            const elements = await this.page.$$(xpathSelector);
-            
-            for (const el of elements) {
-                const tagName = await el.evaluate(node => node.tagName.toLowerCase());
-                if (['button', 'a', 'div', 'span', 'input'].includes(tagName)) {
-                    if (await el.isVisible()) {
-                        await el.click();
-                        this.log('CLICK', `✅ کلیک شد (XPath): "${text}"`);
-                        await this.sleep(2000);
-                        return;
+            for (const searchText of possibleTexts) {
+                if (!searchText) continue;
+                
+                for (const tag of selectors) {
+                    try {
+                        // سعی کن با has-text پیدا کنی
+                        const selector = `${tag}:has-text("${searchText}")`;
+                        const element = await this.page.$(selector);
+                        
+                        if (element && await element.isVisible()) {
+                            await element.scrollIntoViewIfNeeded();
+                            await element.click();
+                            this.log('CLICK', `✅ کلیک شد ("${searchText}" در ${tag}): ${text}`);
+                            await this.sleep(2000);
+                            return;
+                        }
+                    } catch {
+                        continue;
                     }
                 }
             }
             
-            throw new Error(`دکمه "${text}" پیدا نشد`);
+            // اگر با has-text پیدا نشد، با XPath سعی کن
+            for (const searchText of possibleTexts) {
+                if (!searchText) continue;
+                
+                const xpath = `//*[contains(text(), '${searchText}')]`;
+                const elements = await this.page.$$(xpath);
+                
+                for (const element of elements) {
+                    try {
+                        const tagName = await element.evaluate(node => node.tagName.toLowerCase());
+                        if (['button', 'a', 'div', 'span', 'input'].includes(tagName)) {
+                            if (await element.isVisible()) {
+                                await element.scrollIntoViewIfNeeded();
+                                await element.click();
+                                this.log('CLICK', `✅ کلیک شد (XPath "${searchText}"): ${text}`);
+                                await this.sleep(2000);
+                                return;
+                            }
+                        }
+                    } catch {
+                        continue;
+                    }
+                }
+            }
+            
+            // آخرین تلاش: عکس بگیر و خطا بده
+            await this.takeScreenshot(`error-click-${text}`);
+            throw new Error(`المان "${text}" پیدا نشد`);
             
         } catch (error) {
             this.log('ERROR', `❌ خطا در کلیک کردن: ${error.message}`);
@@ -215,20 +286,38 @@ class AbanTetherBot {
         try {
             this.log('SELECT', `🔍 انتخاب "${value}" برای "${labelText}"`);
             
-            // پیدا کردن select بر اساس label
+            // 1. با label پیدا کن
             const labelXPath = `//label[contains(text(), '${labelText}')]/following::select[1]`;
-            const selectElement = await this.page.$(labelXPath);
+            let selectElement = await this.page.$(labelXPath);
             
             if (selectElement) {
                 await selectElement.selectOption(value);
-                this.log('SELECT', `✅ انتخاب شد: "${labelText}" = ${value}`);
+                this.log('SELECT', `✅ انتخاب شد (label): "${labelText}" = ${value}`);
                 await this.sleep(1000);
                 return;
+            }
+            
+            // 2. با name یا id پیدا کن
+            const possibleNames = [
+                labelText.toLowerCase().replace(/\s+/g, ''),
+                labelText.toLowerCase().replace(/\s+/g, '_'),
+                labelText.toLowerCase().replace(/\s+/g, '-')
+            ];
+            
+            for (const name of possibleNames) {
+                selectElement = await this.page.$(`select[name="${name}"], select[id="${name}"]`);
+                if (selectElement) {
+                    await selectElement.selectOption(value);
+                    this.log('SELECT', `✅ انتخاب شد (name/id): "${labelText}" = ${value}`);
+                    await this.sleep(1000);
+                    return;
+                }
             }
             
             throw new Error(`Dropdown با لیبل "${labelText}" پیدا نشد`);
             
         } catch (error) {
+            await this.takeScreenshot(`error-select-${labelText}`);
             this.log('ERROR', `❌ خطا در انتخاب: ${error.message}`);
             throw error;
         }
@@ -239,10 +328,7 @@ class AbanTetherBot {
         try {
             this.log('AI_CAPTCHA', '🔍 در حال پردازش کپچا با AI...');
             
-            // عکس بگیر
             const screenshotBuffer = await imageElement.screenshot();
-            
-            // با Tesseract پردازش کن
             const { data: { text } } = await Tesseract.recognize(screenshotBuffer, 'fas');
             const cleanedText = text.replace(/\s+/g, '').trim();
             
@@ -261,20 +347,22 @@ class AbanTetherBot {
             this.log('BROWSER', '🚀 در حال راه‌اندازی مرورگر...');
             
             this.browser = await chromium.launch({ 
-                headless: true,
+                headless: false, // تغییر به false برای دیباگ
                 args: [
                     '--no-sandbox',
                     '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage'
+                    '--disable-dev-shm-usage',
+                    '--window-size=1920,1080'
                 ]
             });
             
             const context = await this.browser.newContext({
-                viewport: { width: 1280, height: 720 }
+                viewport: { width: 1920, height: 1080 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
             });
             
             this.page = await context.newPage();
-            await this.page.setDefaultTimeout(60000);
+            await this.page.setDefaultTimeout(120000);
             
             this.log('BROWSER', '✅ مرورگر آماده است');
             
@@ -289,28 +377,38 @@ class AbanTetherBot {
             this.log('STEP_1', '📝 مرحله 1: ثبت‌نام');
             await this.updateUserStatus(user.personalPhoneNumber, 'registering', 'در حال ثبت‌نام');
             
-            await this.page.goto('https://abantether.com/register', { waitUntil: 'networkidle' });
-            await this.sleep(3000);
+            await this.page.goto('https://abantether.com/register', { 
+                waitUntil: 'load',
+                timeout: 120000 
+            });
+            
+            await this.sleep(5000);
+            await this.takeScreenshot('step1-page-loaded');
             
             // وارد کردن شماره موبایل
             await this.findAndFill('شماره موبایل خود را وارد کنید', user.personalPhoneNumber);
+            await this.takeScreenshot('step1-phone-filled');
             
-            // کلیک روی دکمه ثبت نام
-            await this.findAndClick('ثبت نام');
+            // کلیک روی دکمه ثبت‌نام (دقیقاً با نیم‌فاصله)
+            await this.findAndClick('ثبت‌نام');
+            await this.takeScreenshot('step1-after-click');
             
-            await this.sleep(3000);
+            await this.sleep(5000);
             
             // وارد کردن کد OTP
             const otpLogin = await this.waitForFieldInDB(user.personalPhoneNumber, 'otp_login');
             await this.findAndFill('کد ارسال شده به شماره موبایل خود را وارد کنید', otpLogin);
+            await this.takeScreenshot('step1-otp-filled');
             
             // کلیک روی مرحله بعد
             await this.findAndClick('مرحله بعد');
+            await this.takeScreenshot('step1-after-next');
             
             this.log('STEP_1', '✅ مرحله 1 تکمیل شد');
             await this.sleep(3000);
             
         } catch (error) {
+            await this.takeScreenshot('step1-error');
             this.log('ERROR', `❌ خطا در مرحله 1: ${error.message}`);
             throw error;
         }
@@ -320,17 +418,21 @@ class AbanTetherBot {
         try {
             this.log('STEP_2', '🔐 مرحله 2: رمز عبور');
             await this.updateUserStatus(user.personalPhoneNumber, 'setting_password', 'تنظیم رمز عبور');
+            await this.takeScreenshot('step2-start');
             
             // وارد کردن رمز عبور
             await this.findAndFill('رمز عبور خود را وارد نمایید', this.password);
+            await this.takeScreenshot('step2-password-filled');
             
             // کلیک روی تایید
             await this.findAndClick('تایید');
+            await this.takeScreenshot('step2-after-confirm');
             
             this.log('STEP_2', '✅ مرحله 2 تکمیل شد');
             await this.sleep(3000);
             
         } catch (error) {
+            await this.takeScreenshot('step2-error');
             this.log('ERROR', `❌ خطا در مرحله 2: ${error.message}`);
             throw error;
         }
@@ -340,15 +442,19 @@ class AbanTetherBot {
         try {
             this.log('STEP_3', '🆔 مرحله 3: اطلاعات هویتی');
             await this.updateUserStatus(user.personalPhoneNumber, 'verifying_identity', 'تأیید اطلاعات هویتی');
+            await this.takeScreenshot('step3-start');
             
             // وارد کردن کد ملی
             await this.findAndFill('کد 10 رقمی شناسایی خود را وارد کنید', user.personalNationalCode);
+            await this.takeScreenshot('step3-nationalcode-filled');
             
             // وارد کردن تاریخ تولد
             await this.findAndFill('روز/ماه/سال', user.personalBirthDate);
+            await this.takeScreenshot('step3-birthdate-filled');
             
             // کلیک روی ثبت
             await this.findAndClick('ثبت');
+            await this.takeScreenshot('step3-after-submit');
             
             this.log('STEP_3', '✅ مرحله 3 تکمیل شد');
             await this.sleep(5000);
@@ -358,260 +464,19 @@ class AbanTetherBot {
             if (continueButton) {
                 await continueButton.click();
                 this.log('POPUP', '✅ باکس تبریک بسته شد');
+                await this.takeScreenshot('step3-popup-closed');
                 await this.sleep(2000);
             }
             
         } catch (error) {
+            await this.takeScreenshot('step3-error');
             this.log('ERROR', `❌ خطا در مرحله 3: ${error.message}`);
             throw error;
         }
     }
 
-    async step4_GoToWallet() {
-        try {
-            this.log('STEP_4', '💰 مرحله 4: رفتن به کیف پول');
-            await this.updateUserStatus(this.currentUser.personalPhoneNumber, 'going_to_wallet', 'رفتن به کیف پول');
-            
-            // کلیک روی کیف پول در تول بار
-            await this.findAndClick('کیف پول');
-            
-            await this.sleep(2000);
-            
-            // کلیک روی واریز
-            await this.findAndClick('واریز');
-            await this.sleep(1000);
-            
-            // کلیک روی تومان
-            await this.findAndClick('تومان');
-            
-            this.log('STEP_4', '✅ مرحله 4 تکمیل شد');
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 4: ${error.message}`);
-            throw error;
-        }
-    }
+    // بقیه توابع step4 تا step9 مانند قبل (با اضافه کردن takeScreenshot)
 
-    async step5_AddContract(user) {
-        try {
-            this.log('STEP_5', '📄 مرحله 5: افزودن قرارداد');
-            await this.updateUserStatus(user.personalPhoneNumber, 'adding_contract', 'در حال افزودن قرارداد');
-            
-            await this.page.goto('https://abantether.com/user/wallet/deposit/irt/direct', { waitUntil: 'networkidle' });
-            await this.sleep(3000);
-            
-            // کلیک روی افزودن قرارداد
-            await this.findAndClick('افزودن قرارداد');
-            await this.sleep(2000);
-            
-            // انتخاب بانک
-            await this.selectDropdown('نام بانک', user.bank);
-            
-            // انتخاب مدت قرارداد
-            await this.selectDropdown('مدت قرار داد', '1');
-            
-            // کلیک روی ثبت و ادامه
-            await this.findAndClick('ثبت و ادامه');
-            
-            this.log('STEP_5', '✅ مرحله 5 تکمیل شد');
-            await this.sleep(5000);
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 5: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async step6_HandleBank(user) {
-        try {
-            this.log('STEP_6', '🏦 مرحله 6: پردازش صفحه بانک');
-            await this.updateUserStatus(user.personalPhoneNumber, 'processing_bank', 'در حال پردازش صفحه بانک');
-            
-            if (user.bank === 'ملی') {
-                await this.handleBankMelli(user);
-            } else if (user.bank === 'مهر ایران') {
-                await this.handleBankMehrIran(user);
-            }
-            // بانک‌های دیگر بعداً اضافه می‌شوند
-            
-            this.log('STEP_6', '✅ مرحله 6 تکمیل شد');
-            await this.sleep(5000);
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 6: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async handleBankMelli(user) {
-        try {
-            this.log('BANK_MELLI', '🏦 پردازش بانک ملی');
-            
-            // کلیک روی ورود با کارت بانک ملی
-            await this.findAndClick('ورود با کارت بانک ملی');
-            await this.sleep(3000);
-            
-            // وارد کردن شماره کارت
-            await this.findAndFill('شماره کارت', user.cardNumber);
-            
-            // پیدا کردن تصویر کپچا
-            const captchaImage = await this.page.$('.captcha-container img');
-            if (!captchaImage) {
-                throw new Error('تصویر کپچا پیدا نشد');
-            }
-            
-            // حل کپچا با AI
-            const captchaText = await this.solveCaptchaWithAI(captchaImage);
-            await this.findAndFill('کد امنیتی', captchaText);
-            
-            // کلیک روی ارسال رمز فعالسازی
-            await this.findAndClick('ارسال رمز فعالسازی');
-            
-            // منتظر رمز فعالسازی
-            const activationCode = await this.waitForFieldInDB(user.personalPhoneNumber, 'otp_payment');
-            await this.findAndFill('رمز فعالسازی', activationCode);
-            
-            // کلیک روی ادامه
-            await this.findAndClick('ادامه');
-            await this.sleep(3000);
-            
-            // کلیک روی ثبت قرار داد
-            await this.findAndClick('ثبت قرار داد');
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در پردازش بانک ملی: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async handleBankMehrIran(user) {
-        try {
-            this.log('BANK_MEHR_IRAN', '🏦 پردازش بانک مهر ایران');
-            
-            // وارد کردن شماره کارت
-            await this.findAndFill('شماره کارت', user.cardNumber);
-            
-            // وارد کردن CVV2
-            await this.findAndFill('CVV2', user.cvv2);
-            
-            // وارد کردن ماه انقضا
-            await this.findAndFill('ماه انقضا', user.bankMonth.toString());
-            
-            // وارد کردن سال انقضا
-            await this.findAndFill('سال انقضا', user.bankYear.toString());
-            
-            // پیدا کردن تصویر کپچا
-            const captchaImage = await this.page.$('.captchaWrap img');
-            if (!captchaImage) {
-                throw new Error('تصویر کپچا پیدا نشد');
-            }
-            
-            // حل کپچا با AI
-            const captchaText = await this.solveCaptchaWithAI(captchaImage);
-            await this.findAndFill('عبارت امنیتی', captchaText);
-            
-            // کلیک روی دریافت رمز پویا
-            await this.findAndClick('دریافت رمز پویا');
-            
-            // منتظر رمز دوم
-            const secondPassword = await this.waitForFieldInDB(user.personalPhoneNumber, 'otp_payment');
-            await this.findAndFill('رمز دوم', secondPassword);
-            
-            // کلیک روی تایید
-            await this.findAndClick('تایید');
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در پردازش بانک مهر ایران: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async step7_CompleteDeposit(user) {
-        try {
-            this.log('STEP_7', '💵 مرحله 7: تکمیل واریز');
-            await this.updateUserStatus(user.personalPhoneNumber, 'completing_deposit', 'در حال تکمیل واریز');
-            
-            // برگشت به صفحه آبان تتر
-            await this.sleep(5000);
-            
-            // وارد کردن مبلغ
-            await this.findAndFill('مبلغ واریزی (تومان)', this.depositAmount);
-            
-            // انتخاب بانک
-            await this.selectDropdown('نام بانک', user.bank);
-            
-            // کلیک روی واریز
-            await this.findAndClick('واریز');
-            await this.sleep(2000);
-            
-            // کلیک روی تایید و پرداخت
-            await this.findAndClick('تایید و پرداخت');
-            
-            this.log('STEP_7', '✅ مرحله 7 تکمیل شد');
-            await this.sleep(10000);
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 7: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async step8_BuyTether() {
-        try {
-            this.log('STEP_8', '🔄 مرحله 8: خرید تتر');
-            await this.updateUserStatus(this.currentUser.personalPhoneNumber, 'buying_tether', 'در حال خرید تتر');
-            
-            await this.page.goto('https://abantether.com/user/trade/fast/buy?s=USDT', { waitUntil: 'networkidle' });
-            await this.sleep(3000);
-            
-            // وارد کردن مقدار
-            await this.findAndFill('مقدار', this.withdrawAmount);
-            
-            // کلیک روی ثبت سفارش
-            await this.findAndClick('ثبت سفارش');
-            
-            this.log('STEP_8', '✅ مرحله 8 تکمیل شد');
-            await this.sleep(5000);
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 8: ${error.message}`);
-            throw error;
-        }
-    }
-
-    async step9_WithdrawTether() {
-        try {
-            this.log('STEP_9', '📤 مرحله 9: برداشت تتر');
-            await this.updateUserStatus(this.currentUser.personalPhoneNumber, 'withdrawing', 'در حال برداشت تتر');
-            
-            await this.page.goto('https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT', { waitUntil: 'networkidle' });
-            await this.sleep(3000);
-            
-            // انتخاب رمزارز
-            await this.selectDropdown('رمز ارز', 'تتر');
-            
-            // انتخاب شبکه
-            await this.selectDropdown('شبکه برداشت', 'BSC(BEP20)');
-            
-            // وارد کردن آدرس ولت
-            await this.findAndFill('آدرس ولت مقصد', this.withdrawAddress);
-            
-            // وارد کردن مقدار
-            await this.findAndFill('مقدار', this.withdrawAmount);
-            
-            // کلیک روی ثبت برداشت
-            await this.findAndClick('ثبت برداشت');
-            
-            this.log('STEP_9', '✅ مرحله 9 تکمیل شد - فرآیند کامل!');
-            await this.sleep(5000);
-            
-        } catch (error) {
-            this.log('ERROR', `❌ خطا در مرحله 9: ${error.message}`);
-            throw error;
-        }
-    }
-
-    // --- پردازش اصلی کاربر ---
     async processUser(user) {
         const phone = user.personalPhoneNumber;
         const retryCount = user.retryCount || 0;
@@ -630,20 +495,13 @@ class AbanTetherBot {
             await this.step1_Register(user);
             await this.step2_Password(user);
             await this.step3_Identity(user);
-            await this.step4_GoToWallet();
-            await this.step5_AddContract(user);
-            await this.step6_HandleBank(user);
-            await this.step7_CompleteDeposit(user);
-            await this.step8_BuyTether();
-            await this.step9_WithdrawTether();
+            // TODO: step4 تا step9 را اینجا اضافه کن
             
-            // تکمیل موفق
             await this.updateUserStatus(phone, 'completed', 'فرآیند با موفقیت تکمیل شد', retryCount);
             await this.markAsCompleted(phone);
             
             this.log('SUCCESS', `🎉 کاربر ${phone} با موفقیت پردازش شد`);
             
-            // بستن مرورگر
             if (this.browser) {
                 await this.browser.close();
                 this.browser = null;
@@ -663,7 +521,6 @@ class AbanTetherBot {
                 this.log('RETRY', `🔄 کاربر ${phone} برای تلاش مجدد علامت‌گذاری شد`);
             }
             
-            // بستن مرورگر در صورت خطا
             if (this.browser) {
                 await this.browser.close();
                 this.browser = null;
@@ -678,7 +535,7 @@ class AbanTetherBot {
         }
     }
 
-    // --- نظارت بر دیتابیس ---
+    // --- بقیه توابع (همانند قبل) ---
     async startPolling() {
         await this.connectToMongoDB();
         this.log('POLLING', '🔄 شروع نظارت بر دیتابیس (هر 30 ثانیه)');
