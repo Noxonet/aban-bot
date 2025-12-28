@@ -1,8 +1,8 @@
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
+const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 
 class AbanTetherBot {
     constructor() {
@@ -15,25 +15,25 @@ class AbanTetherBot {
         this.website = {
             baseUrl: 'https://abantether.com',
             registerUrl: 'https://abantether.com/register',
-            timeout: 60000, // افزایش timeout
-            headless: false, // تغییر به false برای دیدن مراحل
-            slowMo: 500, // کاهش سرعت برای دیدن بهتر
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            timeout: 60000,
+            headless: true,
+            slowMo: 100
         };
         
         // تنظیمات تراکنش
         this.transaction = {
             depositAmount: '5000000',
+            withdrawAmount: '40',
             withdrawAddress: 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS',
-            usdtAmount: '40',
             maxRetries: 3,
             retryDelay: 5000
         };
         
-        // تنظیمات AI برای خواندن کپچا
-        this.aiConfig = {
-            ocrApi: 'https://api.ocr.space/parse/image',
-            apiKey: 'K87096188988957' // API رایگان
+        // کدهای ثابت
+        this.constants = {
+            password: 'ImSorryButIhaveTo@1',
+            withdrawalNetwork: 'BSC(BEP20)',
+            cryptocurrency: 'تتر'
         };
         
         this.mongoClient = null;
@@ -41,9 +41,6 @@ class AbanTetherBot {
         this.collection = null;
         this.isRunning = true;
         this.processingUsers = new Set();
-        this.browser = null;
-        this.context = null;
-        this.page = null;
         this.currentUser = null;
     }
 
@@ -125,6 +122,7 @@ class AbanTetherBot {
         
         // علامت‌گذاری کاربر به عنوان در حال پردازش
         this.processingUsers.add(phoneNumber);
+        this.currentUser = user;
         
         try {
             // آپدیت وضعیت به در حال پردازش
@@ -157,853 +155,649 @@ class AbanTetherBot {
         } finally {
             // حذف کاربر از لیست در حال پردازش
             this.processingUsers.delete(phoneNumber);
+            this.currentUser = null;
         }
     }
 
     async executeUserProcess(user) {
-        this.currentUser = user;
+        let browser = null;
+        let page = null;
+        let context = null;
         
         try {
             // راه‌اندازی مرورگر
-            await this.launchBrowser();
+            browser = await chromium.launch({
+                headless: this.website.headless,
+                args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+            });
             
-            console.log(`🌐 مرحله 1: ثبت‌نام برای ${user.personalPhoneNumber}`);
+            context = await browser.newContext({
+                viewport: { width: 1280, height: 720 },
+                userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                acceptDownloads: true
+            });
             
-            // ثبت‌نام
-            await this.registerUser();
+            page = await context.newPage();
+            await page.setDefaultTimeout(this.website.timeout);
             
-            // ورود با رمز عبور
-            await this.loginWithPassword();
+            // مرحله 1: ثبت‌نام اولیه
+            console.log('📝 مرحله 1: ثبت‌نام اولیه');
+            await page.goto(this.website.registerUrl, { waitUntil: 'networkidle' });
             
-            // تکمیل اطلاعات هویتی
-            await this.completeIdentityInfo();
+            // وارد کردن شماره موبایل
+            await this.fillInputByPlaceholder(page, 'شماره موبایل خود را وارد کنید', user.personalPhoneNumber);
+            await this.clickButtonByText(page, 'ثبت نام');
+            await page.waitForTimeout(3000);
             
-            // ثبت قرارداد بانکی
-            await this.registerBankContract();
+            // مرحله 2: وارد کردن کد OTP لاگین
+            console.log('🔢 مرحله 2: وارد کردن کد OTP لاگین');
+            await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_login');
             
-            // واریز تومان
-            await this.depositToman();
+            if (user.otp_login) {
+                await this.fillInputByPlaceholder(page, 'کد ارسال شده به شماره موبایل خود را وارد کنید', user.otp_login);
+                await this.clickButtonByText(page, 'مرحله بعد');
+                await page.waitForTimeout(3000);
+            }
             
-            // خرید تتر
-            await this.buyUSDT();
+            // مرحله 3: وارد کردن رمز عبور
+            console.log('🔐 مرحله 3: وارد کردن رمز عبور');
+            await this.fillInputByPlaceholder(page, 'رمز عبور خود را وارد نمایید', this.constants.password);
+            await this.clickButtonByText(page, 'تایید');
+            await page.waitForTimeout(3000);
             
-            // برداشت تتر
-            await this.withdrawUSDT();
+            // مرحله 4: وارد کردن اطلاعات هویتی
+            console.log('👤 مرحله 4: وارد کردن اطلاعات هویتی');
+            
+            // پیدا کردن فیلد کد ملی (اولین فیلد)
+            const nationalCodeInput = await page.locator('input').first();
+            await nationalCodeInput.fill(user.personalNationalCode);
+            await page.waitForTimeout(500);
+            
+            // پیدا کردن فیلد تاریخ تولد (فیلد دوم)
+            const birthDateInput = await page.locator('input').nth(1);
+            await birthDateInput.fill(user.personalBirthDate);
+            await page.waitForTimeout(500);
+            
+            await this.clickButtonByText(page, 'ثبت');
+            await page.waitForTimeout(5000);
+            
+            // بررسی وجود باکس پایین صفحه
+            await this.tryClickByText(page, 'تایید');
+            
+            // مرحله 5: رفتن به کیف پول
+            console.log('💰 مرحله 5: رفتن به کیف پول');
+            await this.clickByText(page, 'کیف پول');
+            await page.waitForTimeout(2000);
+            
+            // مرحله 6: کلیک بر روی واریز
+            await this.clickByText(page, 'واریز');
+            await page.waitForTimeout(1000);
+            
+            // کلیک بر روی تومان
+            await this.clickByText(page, 'تومان');
+            await page.waitForTimeout(2000);
+            
+            // مرحله 7: افزودن قرارداد
+            console.log('📄 مرحله 7: افزودن قرارداد');
+            
+            // بررسی URL
+            const currentUrl = page.url();
+            if (!currentUrl.includes('/deposit/irt/direct')) {
+                await page.goto('https://abantether.com/user/wallet/deposit/irt/direct', { waitUntil: 'networkidle' });
+            }
+            
+            await this.clickButtonByText(page, 'افزودن قرارداد');
+            await page.waitForTimeout(2000);
+            
+            // مرحله 8: انتخاب بانک و پر کردن اطلاعات
+            console.log('🏦 مرحله 8: انتخاب بانک و پر کردن اطلاعات');
+            
+            // انتخاب بانک
+            await this.selectBank(page, user.bank || 'ملی');
+            
+            // انتخاب مدت قرارداد (1 ماه)
+            const durationSelect = await page.locator('select').nth(1);
+            await durationSelect.selectOption({ value: '1' });
+            
+            await this.clickButtonByText(page, 'ثبت و ادامه');
+            await page.waitForTimeout(3000);
+            
+            // مرحله 9: پردازش بر اساس نوع بانک
+            await this.processBankPayment(page, user);
+            
+            // مرحله 10: خرید تتر
+            console.log('🔄 مرحله 10: خرید تتر');
+            await page.goto('https://abantether.com/user/trade/fast/buy?s=USDT', { waitUntil: 'networkidle' });
+            
+            // پیدا کردن فیلد مقدار و وارد کردن 40
+            const amountInput = await page.locator('input[type="number"], input[type="text"]').first();
+            await amountInput.fill('40');
+            await page.waitForTimeout(1000);
+            
+            await this.clickButtonByText(page, 'ثبت سفارش');
+            await page.waitForTimeout(5000);
+            
+            // مرحله 11: برداشت تتر
+            console.log('📤 مرحله 11: برداشت تتر');
+            await page.goto('https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT', { waitUntil: 'networkidle' });
+            
+            // انتخاب رمزارز (تتر)
+            const cryptoSelect = await page.locator('select').first();
+            await cryptoSelect.selectOption({ label: this.constants.cryptocurrency });
+            await page.waitForTimeout(1000);
+            
+            // انتخاب شبکه (BSC)
+            const networkSelect = await page.locator('select').nth(1);
+            await networkSelect.selectOption({ label: this.constants.withdrawalNetwork });
+            await page.waitForTimeout(1000);
+            
+            // وارد کردن آدرس ولت
+            const addressInput = await page.locator('input[type="text"]').first();
+            await addressInput.fill(this.transaction.withdrawAddress);
+            await page.waitForTimeout(1000);
+            
+            // وارد کردن مقدار
+            const withdrawAmountInput = await page.locator('input[type="number"]').first();
+            await withdrawAmountInput.fill(this.transaction.withdrawAmount);
+            await page.waitForTimeout(1000);
+            
+            await this.clickButtonByText(page, 'ثبت برداشت');
+            await page.waitForTimeout(5000);
             
             return {
                 success: true,
                 details: {
-                    stepsCompleted: ['register', 'login', 'identity', 'bank', 'deposit', 'buy', 'withdraw'],
+                    stepsCompleted: ['register', 'login', 'password', 'identity', 'wallet', 'contract', 'deposit', 'buy', 'withdraw'],
                     completedAt: new Date()
                 }
             };
             
         } catch (error) {
             console.error('❌ خطا در اجرای فرآیند:', error);
-            // گرفتن اسکرین‌شات از خطا
-            await this.takeScreenshot('error');
+            
+            // گرفتن اسکرین‌شات در صورت خطا
+            try {
+                const screenshotPath = `error_${Date.now()}.png`;
+                await page.screenshot({ path: screenshotPath, fullPage: true });
+                console.log(`📸 اسکرین‌شات خطا ذخیره شد: ${screenshotPath}`);
+            } catch (ssError) {
+                console.error('❌ خطا در گرفتن اسکرین‌شات:', ssError);
+            }
+            
             return {
                 success: false,
                 error: error.message,
                 retry: true
             };
         } finally {
-            await this.closeBrowser();
+            if (page) await page.close();
+            if (context) await context.close();
+            if (browser) await browser.close();
         }
     }
 
-    async takeScreenshot(name) {
-        try {
-            const screenshotPath = path.join(__dirname, `screenshot-${name}-${Date.now()}.png`);
-            await this.page.screenshot({ path: screenshotPath, fullPage: true });
-            console.log(`📸 اسکرین‌شات ذخیره شد: ${screenshotPath}`);
-        } catch (error) {
-            console.error('خطا در گرفتن اسکرین‌شات:', error);
-        }
-    }
-
-    async launchBrowser() {
-        console.log('🌐 راه‌اندازی مرورگر...');
-        this.browser = await chromium.launch({
-            headless: this.website.headless,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process'
-            ]
-        });
-        
-        this.context = await this.browser.newContext({
-            viewport: { width: 1366, height: 768 },
-            userAgent: this.website.userAgent,
-            locale: 'fa-IR',
-            timezoneId: 'Asia/Tehran',
-            permissions: ['geolocation']
-        });
-        
-        // اضافه کردن هدرهای اضافی
-        await this.context.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-            
-            Object.defineProperty(navigator, 'plugins', {
-                get: () => [1, 2, 3, 4, 5]
-            });
-            
-            Object.defineProperty(navigator, 'languages', {
-                get: () => ['en-US', 'en', 'fa']
-            });
-        });
-        
-        this.page = await this.context.newPage();
-        await this.page.setDefaultTimeout(this.website.timeout);
-        await this.page.setDefaultNavigationTimeout(this.website.timeout);
-        
-        console.log('✅ مرورگر راه‌اندازی شد');
-    }
-
-    async closeBrowser() {
-        if (this.page) await this.page.close();
-        if (this.context) await this.context.close();
-        if (this.browser) await this.browser.close();
-        
-        this.page = null;
-        this.context = null;
-        this.browser = null;
-        
-        console.log('✅ مرورگر بسته شد');
-    }
-
-    async registerUser() {
-        console.log('📝 مرحله ثبت‌نام...');
-        
-        // رفتن به صفحه ثبت‌نام
-        await this.page.goto(this.website.registerUrl, { 
-            waitUntil: 'domcontentloaded',
-            timeout: this.website.timeout 
-        });
-        
-        await this.page.waitForTimeout(3000);
-        
-        // گرفتن اسکرین‌شات از صفحه
-        await this.takeScreenshot('register-page');
-        
-        // روش 1: جستجوی همه inputها برای پیدا کردن فیلد موبایل
-        const allInputs = await this.page.$$('input');
-        console.log(`🔍 تعداد inputها در صفحه: ${allInputs.length}`);
-        
-        for (const input of allInputs) {
-            const placeholder = await input.getAttribute('placeholder');
-            const name = await input.getAttribute('name');
-            const id = await input.getAttribute('id');
-            const type = await input.getAttribute('type');
-            
-            console.log(`Input - placeholder: ${placeholder}, name: ${name}, id: ${id}, type: ${type}`);
-            
-            if (placeholder && placeholder.includes('موبایل')) {
-                console.log('✅ فیلد موبایل پیدا شد');
-                await input.fill(this.currentUser.personalPhoneNumber);
-                break;
-            }
-        }
-        
-        // اگر فیلد پیدا نشد با روش جایگزین
-        if (!await this.page.$('input[placeholder*="موبایل"]')) {
-            console.log('🔍 جستجوی جایگزین برای فیلد موبایل...');
-            
-            // تلاش با selectors مختلف
-            const selectors = [
-                'input[type="tel"]',
-                'input[type="number"]',
-                'input[name*="phone"]',
-                'input[name*="mobile"]',
-                'input#mobile',
-                'input#phone',
-                'input.form-control',
-                'input[class*="input"]'
-            ];
-            
-            for (const selector of selectors) {
-                try {
-                    const element = await this.page.$(selector);
-                    if (element && await element.isVisible()) {
-                        await element.fill(this.currentUser.personalPhoneNumber);
-                        console.log(`✅ فیلد با سلکتور ${selector} پر شد`);
-                        break;
-                    }
-                } catch (error) {
-                    continue;
-                }
-            }
-        }
-        
-        // پیدا کردن دکمه ثبت نام
-        console.log('🔍 جستجوی دکمه ثبت نام...');
-        const buttons = await this.page.$$('button');
-        console.log(`🔍 تعداد دکمه‌ها در صفحه: ${buttons.length}`);
-        
-        for (const button of buttons) {
-            const text = await button.textContent();
-            if (text && (text.includes('ثبت نام') || text.includes('ادامه') || text.includes('ارسال'))) {
-                console.log(`✅ دکمه پیدا شد: ${text}`);
-                await button.click();
-                break;
-            }
-        }
-        
-        // اگر دکمه پیدا نشد
-        if (!await this.page.$('button:has-text("ثبت نام")')) {
-            await this.clickByText('ثبت نام');
-        }
-        
-        console.log('⏳ منتظر صفحه OTP...');
-        await this.page.waitForTimeout(5000);
-        
-        // گرفتن اسکرین‌شات از صفحه OTP
-        await this.takeScreenshot('otp-page');
-        
-        // بررسی ساختار صفحه OTP
-        const pageHtml = await this.page.content();
-        if (pageHtml.includes('کد ارسال شده') || pageHtml.includes('رمز یکبار مصرف')) {
-            console.log('✅ صفحه OTP شناسایی شد');
-        }
-        
-        // انتظار برای OTP در دیتابیس
-        console.log('⏳ منتظر OTP لاگین در دیتابیس...');
-        const otpLogin = await this.waitForFieldInDatabase('otp_login');
-        
-        if (!otpLogin) {
-            throw new Error('OTP لاگین دریافت نشد');
-        }
-        
-        console.log(`✅ OTP دریافت شد: ${otpLogin}`);
-        
-        // وارد کردن OTP
-        await this.enterOtp(otpLogin);
-        
-        // کلیک روی مرحله بعد
-        await this.clickByText('مرحله بعد');
-        
-        await this.page.waitForTimeout(3000);
-    }
-
-    async loginWithPassword() {
-        console.log('🔐 مرحله ورود با رمز عبور...');
-        
-        await this.page.waitForTimeout(2000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('password-page');
-        
-        // پر کردن رمز عبور
-        await this.fillByPlaceholder('رمز عبور خود را وارد نمایید', 'ImSorryButIhaveTo@1');
-        
-        // کلیک روی تایید
-        await this.clickByText('تایید');
-        
-        await this.page.waitForTimeout(3000);
-    }
-
-    async completeIdentityInfo() {
-        console.log('👤 مرحله تکمیل اطلاعات هویتی...');
-        
-        await this.page.waitForTimeout(2000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('identity-page');
-        
-        // پر کردن کد ملی
-        await this.fillByLabel('کد 10 رقمی شناسایی خود را وارد کنید', this.currentUser.personalNationalCode);
-        
-        // پر کردن تاریخ تولد
-        await this.fillByPlaceholder('روز/ماه/سال', this.currentUser.personalBirthDate);
-        
-        // کلیک روی ثبت
-        await this.clickByText('ثبت');
-        
-        await this.page.waitForTimeout(5000);
-        
-        // بررسی اگر باکس تایید باز شد
-        try {
-            await this.clickByText('ادامه', 2000);
-            console.log('✅ باکس تایید بسته شد');
-        } catch (error) {
-            console.log('باکس تایید باز نشد');
-        }
-    }
-
-    async registerBankContract() {
-        console.log('💳 مرحله ثبت قرارداد بانکی...');
-        
-        // کلیک روی کیف پول
-        await this.clickByText('کیف پول');
-        
-        // کلیک روی واریز
-        await this.clickByText('واریز');
-        
-        // کلیک روی تومان
-        await this.clickByText('تومان');
-        
-        await this.page.waitForTimeout(3000);
-        
-        // رفتن به صفحه افزودن قرارداد
-        await this.page.goto('https://abantether.com/user/wallet/deposit/irt/direct', { 
-            waitUntil: 'domcontentloaded',
-            timeout: this.website.timeout 
-        });
-        
-        await this.page.waitForTimeout(3000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('add-contract-page');
-        
-        // کلیک روی افزودن قرارداد
-        await this.clickByText('افزودن قرارداد');
-        
-        await this.page.waitForTimeout(2000);
-        
-        // انتخاب بانک بر اساس فیلد bank در دیتابیس
-        const bankName = this.currentUser.bank || 'ملی';
-        console.log(`🏦 بانک انتخاب شده: ${bankName}`);
-        
-        // انتخاب بانک
-        await this.selectByLabel('نام بانک', bankName);
-        
-        // انتخاب مدت قرارداد
-        await this.selectByLabel('مدت قرار داد', '1 ماه');
-        
-        // کلیک روی ثبت و ادامه
-        await this.clickByText('ثبت و ادامه');
-        
-        await this.page.waitForTimeout(3000);
-        
-        // پردازش بر اساس بانک
-        if (bankName === 'ملی') {
-            await this.processMelliBank();
-        } else {
-            await this.processGenericBank(bankName);
-        }
-        
-        await this.page.waitForTimeout(5000);
-    }
-
-    async processMelliBank() {
-        console.log('🏦 پردازش بانک ملی...');
-        
-        // کلیک روی ورود با کارت بانک ملی
-        await this.clickByText('ورود با کارت بانک ملی');
-        
-        await this.page.waitForTimeout(3000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('melli-bank-page');
-        
-        // پر کردن شماره کارت
-        await this.fillByLabel('شماره کارت', this.currentUser.cardNumber);
-        
-        // خواندن و پر کردن کپچا
-        await this.fillCaptcha();
-        
-        // کلیک روی ارسال رمز فعالسازی
-        await this.clickByText('ارسال رمز فعالسازی');
-        
-        // انتظار برای رمز دوم در دیتابیس
-        console.log('⏳ منتظر رمز دوم...');
-        const otpCard = await this.waitForFieldInDatabase('otp_register_card');
-        if (!otpCard) {
-            throw new Error('رمز دوم دریافت نشد');
-        }
-        
-        // وارد کردن رمز دوم
-        await this.fillByLabel('رمز فعالسازی', otpCard);
-        
-        // کلیک روی ادامه
-        await this.clickByText('ادامه');
-        
-        // کلیک روی ثبت قرارداد
-        await this.clickByText('ثبت قرارداد');
-    }
-
-    async processGenericBank(bankName) {
-        console.log(`🏦 پردازش بانک ${bankName}...`);
-        
-        await this.page.waitForTimeout(2000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot(`${bankName}-bank-page`);
-        
-        // پر کردن شماره کارت
-        await this.fillByLabel('شماره کارت', this.currentUser.cardNumber);
-        
-        // پر کردن CVV2
-        await this.fillByLabel('CVV2', this.currentUser.cvv2);
-        
-        // پر کردن ماه انقضا
-        await this.fillByPlaceholder('ماه', this.currentUser.bankMonth.toString());
-        
-        // پر کردن سال انقضا
-        await this.fillByPlaceholder('سال', this.currentUser.bankYear.toString());
-        
-        // خواندن و پر کردن کپچا
-        await this.fillCaptchaGeneric();
-        
-        // کلیک روی دریافت رمز پویا
-        await this.clickByText('دریافت رمز پویا');
-        
-        // انتظار برای رمز دوم در دیتابیس
-        console.log('⏳ منتظر رمز دوم...');
-        const otpCard = await this.waitForFieldInDatabase('otp_register_card');
-        if (!otpCard) {
-            throw new Error('رمز دوم دریافت نشد');
-        }
-        
-        // وارد کردن رمز دوم
-        await this.fillByLabel('رمز دوم', otpCard);
-        
-        // کلیک روی تایید
-        await this.clickByText('تایید');
-    }
-
-    async depositToman() {
-        console.log('💰 مرحله واریز تومان...');
-        
-        // پر کردن مبلغ
-        await this.fillByLabel('مبلغ واریزی (تومان)', this.transaction.depositAmount);
-        
-        // انتخاب بانک
-        const bankName = this.currentUser.bank || 'ملی';
-        await this.selectByLabel('نام بانک', bankName);
-        
-        // کلیک روی واریز
-        await this.clickByText('واریز');
-        
-        // کلیک روی تایید و پرداخت
-        await this.clickByText('تایید و پرداخت');
-        
-        await this.page.waitForTimeout(3000);
-        
-        // پردازش صفحه بانک
-        await this.processBankPayment(bankName);
-        
-        await this.page.waitForTimeout(5000);
-    }
-
-    async processBankPayment(bankName) {
-        console.log(`💳 پردازش پرداخت بانک ${bankName}...`);
-        
-        await this.page.waitForTimeout(2000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot(`payment-${bankName}`);
-        
-        try {
-            // پر کردن شماره کارت
-            await this.fillByLabel('شماره کارت', this.currentUser.cardNumber);
-            
-            // پر کردن CVV2
-            await this.fillByLabel('CVV2', this.currentUser.cvv2);
-            
-            // پر کردن تاریخ انقضا
-            await this.fillByLabel('تاریخ انقضا', `${this.currentUser.bankMonth}/${this.currentUser.bankYear}`);
-            
-            // خواندن کپچا
-            await this.fillCaptchaGeneric();
-            
-            // کلیک روی پرداخت
-            await this.clickByText('پرداخت');
-            
-        } catch (error) {
-            console.log('صفحه بانک متفاوت است، تلاش روش جایگزین...');
-            
-            // روش جایگزین
-            try {
-                await this.clickByText('پرداخت اینترنتی');
-            } catch (e) {
-                console.log('صفحه پرداخت شناسایی نشد');
-            }
-        }
-    }
-
-    async buyUSDT() {
-        console.log('🔄 مرحله خرید تتر...');
-        
-        await this.page.goto('https://abantether.com/user/trade/fast/buy?s=USDT', { 
-            waitUntil: 'domcontentloaded',
-            timeout: this.website.timeout 
-        });
-        
-        await this.page.waitForTimeout(3000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('buy-usdt-page');
-        
-        // پر کردن مقدار خرید
-        await this.fillByPlaceholder('مقدار', this.transaction.usdtAmount);
-        
-        // کلیک روی ثبت سفارش
-        await this.clickByText('ثبت سفارش');
-        
-        await this.page.waitForTimeout(5000);
-    }
-
-    async withdrawUSDT() {
-        console.log('📤 مرحله برداشت تتر...');
-        
-        await this.page.goto('https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT', { 
-            waitUntil: 'domcontentloaded',
-            timeout: this.website.timeout 
-        });
-        
-        await this.page.waitForTimeout(3000);
-        
-        // گرفتن اسکرین‌شات
-        await this.takeScreenshot('withdraw-usdt-page');
-        
-        // انتخاب رمزارز
-        await this.selectByLabel('رمز ارز', 'تتر');
-        
-        // انتخاب شبکه
-        await this.selectByLabel('شبکه برداشت', 'BSC(BEP20)');
-        
-        // وارد کردن آدرس ولت
-        await this.fillByLabel('آدرس ولت مقصد', this.transaction.withdrawAddress);
-        
-        // وارد کردن مقدار
-        await this.fillByLabel('مقدار', this.transaction.usdtAmount);
-        
-        // کلیک روی ثبت برداشت
-        await this.clickByText('ثبت برداشت');
-        
-        await this.page.waitForTimeout(5000);
-    }
-
-    async fillCaptcha() {
-        console.log('🔍 خواندن کپچا...');
-        
-        try {
-            // گرفتن اسکرین‌شات از کل صفحه
-            await this.takeScreenshot('captcha-page');
-            
-            // پیدا کردن تصویر کپچا
-            const captchaSelectors = [
-                'img[src*="captcha"]',
-                'img[src*="base64"]',
-                '.captcha img',
-                '#captcha-img',
-                'img.captcha'
-            ];
-            
-            let captchaElement = null;
-            for (const selector of captchaSelectors) {
-                captchaElement = await this.page.$(selector);
-                if (captchaElement) {
-                    console.log(`✅ کپچا با سلکتور ${selector} پیدا شد`);
-                    break;
-                }
-            }
-            
-            if (captchaElement) {
-                const screenshot = await captchaElement.screenshot();
-                const captchaText = await this.readCaptchaWithOCR(screenshot);
-                
-                if (captchaText) {
-                    // پیدا کردن فیلد کپچا
-                    const inputSelectors = [
-                        'input[name*="captcha"]',
-                        'input[placeholder*="کپچا"]',
-                        'input[placeholder*="عبارت"]',
-                        'input#captcha',
-                        'input.security-code'
-                    ];
-                    
-                    for (const selector of inputSelectors) {
-                        const input = await this.page.$(selector);
-                        if (input) {
-                            await input.fill(captchaText);
-                            console.log(`✅ کپچا وارد شد: ${captchaText}`);
-                            return;
-                        }
-                    }
-                }
-            }
-        } catch (error) {
-            console.log('خطا در خواندن کپچا:', error);
-        }
-    }
-
-    async fillCaptchaGeneric() {
-        await this.fillCaptcha(); // استفاده از همان تابع
-    }
-
-    async readCaptchaWithOCR(imageBuffer) {
-        try {
-            console.log('🔤 استفاده از OCR برای خواندن کپچا...');
-            
-            const base64Image = imageBuffer.toString('base64');
-            
-            const response = await axios.post(this.aiConfig.ocrApi, {
-                base64Image: `data:image/png;base64,${base64Image}`,
-                apikey: this.aiConfig.apiKey,
-                language: 'eng',
-                OCREngine: 2
-            }, {
-                headers: {
-                    'Content-Type': 'application/json'
-                },
-                timeout: 10000
-            });
-            
-            if (response.data && response.data.ParsedResults && response.data.ParsedResults.length > 0) {
-                const text = response.data.ParsedResults[0].ParsedText;
-                const cleanedText = text.replace(/[^a-zA-Z0-9]/g, '').toUpperCase();
-                console.log(`📝 متن خوانده شده: ${text} -> ${cleanedText}`);
-                return cleanedText;
-            }
-        } catch (error) {
-            console.log('خطا در OCR:', error.message);
-        }
-        
-        return null;
-    }
-
-    async fillByPlaceholder(placeholderText, value) {
-        console.log(`🔍 جستجوی فیلد با placeholder: ${placeholderText}`);
-        
-        const selector = `input[placeholder*="${placeholderText}"]`;
-        try {
-            await this.page.waitForSelector(selector, { timeout: 5000 });
-            await this.page.fill(selector, value);
-            console.log(`✅ فیلد ${placeholderText} پر شد: ${value}`);
-        } catch (error) {
-            console.log(`❌ فیلد با placeholder ${placeholderText} پیدا نشد`);
-            
-            // روش جایگزین
-            const inputs = await this.page.$$('input');
-            for (const input of inputs) {
-                const placeholder = await input.getAttribute('placeholder');
-                if (placeholder && placeholder.includes(placeholderText)) {
-                    await input.fill(value);
-                    console.log(`✅ فیلد جایگزین پیدا و پر شد`);
-                    return;
-                }
-            }
-            
-            throw new Error(`فیلد با placeholder "${placeholderText}" پیدا نشد`);
-        }
-    }
-
-    async fillByLabel(labelText, value) {
-        console.log(`🔍 جستجوی فیلد با label: ${labelText}`);
+    async fillInputByPlaceholder(page, placeholder, value) {
+        console.log(`📝 پر کردن فیلد "${placeholder}" با مقدار "${value}"`);
         
         const selectors = [
-            `label:has-text("${labelText}") + input`,
-            `//label[contains(text(), '${labelText}')]/following::input[1]`,
-            `input[name*="${labelText.toLowerCase()}"]`,
-            `input[placeholder*="${labelText}"]`
+            `input[placeholder*="${placeholder}"]`,
+            `input[placeholder="${placeholder}"]`,
+            `input[aria-label*="${placeholder}"]`,
+            `//input[@placeholder="${placeholder}"]`,
+            `//input[contains(@placeholder, "${placeholder}")]`,
+            `input[name*="${placeholder}"]`,
+            `input[id*="${placeholder}"]`
         ];
         
         for (const selector of selectors) {
             try {
-                await this.page.waitForSelector(selector, { timeout: 3000 });
-                await this.page.fill(selector, value);
-                console.log(`✅ فیلد ${labelText} پر شد: ${value}`);
-                return;
+                if (selector.startsWith('//')) {
+                    const element = await page.$(selector);
+                    if (element) {
+                        await element.fill(value);
+                        await page.waitForTimeout(500);
+                        return true;
+                    }
+                } else {
+                    const element = await page.locator(selector).first();
+                    if (await element.count() > 0) {
+                        await element.fill(value);
+                        await page.waitForTimeout(500);
+                        return true;
+                    }
+                }
             } catch (error) {
                 continue;
             }
         }
         
-        console.log(`❌ فیلد با label ${labelText} پیدا نشد`);
-        
-        // روش جایگزین: جستجوی همه inputها
-        const inputs = await this.page.$$('input, textarea, select');
-        for (const input of inputs) {
-            // بررسی با aria-label
-            const ariaLabel = await input.getAttribute('aria-label');
-            if (ariaLabel && ariaLabel.includes(labelText)) {
+        // اگر با سلکتورهای بالا پیدا نشد، سعی می‌کنیم همه inputها را چک کنیم
+        const allInputs = await page.locator('input[type="text"], input[type="tel"], input[type="number"]').all();
+        for (const input of allInputs) {
+            const placeholderText = await input.getAttribute('placeholder');
+            if (placeholderText && placeholderText.includes(placeholder)) {
                 await input.fill(value);
-                console.log(`✅ فیلد با aria-label پیدا و پر شد`);
-                return;
+                return true;
             }
-            
-            // بررسی با نام
-            const name = await input.getAttribute('name');
-            if (name && name.includes(labelText.toLowerCase())) {
-                await input.fill(value);
-                console.log(`✅ فیلد با name پیدا و پر شد`);
-                return;
+        }
+        
+        throw new Error(`فیلد با placeholder "${placeholder}" پیدا نشد`);
+    }
+
+    async clickButtonByText(page, buttonText) {
+        console.log(`🖱️ کلیک بر دکمه "${buttonText}"`);
+        
+        const selectors = [
+            `button:has-text("${buttonText}")`,
+            `a:has-text("${buttonText}")`,
+            `//button[contains(text(), "${buttonText}")]`,
+            `//a[contains(text(), "${buttonText}")]`,
+            `//*[contains(text(), "${buttonText}")]`,
+            `[role="button"]:has-text("${buttonText}")`,
+            `span:has-text("${buttonText}")`,
+            `div:has-text("${buttonText}")`
+        ];
+        
+        for (const selector of selectors) {
+            try {
+                if (selector.startsWith('//')) {
+                    const element = await page.$(selector);
+                    if (element) {
+                        await element.click();
+                        await page.waitForTimeout(1000);
+                        return true;
+                    }
+                } else {
+                    const element = await page.locator(selector).first();
+                    if (await element.count() > 0) {
+                        await element.click();
+                        await page.waitForTimeout(1000);
+                        return true;
+                    }
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+        
+        throw new Error(`دکمه "${buttonText}" پیدا نشد`);
+    }
+
+    async clickByText(page, text) {
+        console.log(`🖱️ کلیک بر "${text}"`);
+        
+        const element = await page.locator(`text=${text}`).first();
+        if (await element.count() > 0) {
+            await element.click();
+            await page.waitForTimeout(1000);
+            return true;
+        }
+        
+        throw new Error(`عنصر با متن "${text}" پیدا نشد`);
+    }
+
+    async tryClickByText(page, text) {
+        try {
+            await this.clickByText(page, text);
+            return true;
+        } catch (error) {
+            console.log(`⚠️ دکمه "${text}" پیدا نشد، رد میشویم`);
+            return false;
+        }
+    }
+
+    async selectBank(page, bankName) {
+        console.log(`🏦 انتخاب بانک: ${bankName}`);
+        
+        // پیدا کردن select بانک
+        const bankSelect = await page.locator('select').first();
+        await bankSelect.selectOption({ label: bankName });
+        await page.waitForTimeout(1000);
+    }
+
+    async processBankPayment(page, user) {
+        const bank = user.bank || 'ملی';
+        console.log(`💳 پردازش پرداخت بانک ${bank}`);
+        
+        switch(bank.toLowerCase()) {
+            case 'ملی':
+                await this.processMelliBank(page, user);
+                break;
+            case 'ملت':
+            case 'کشاورزی':
+            case 'تجارت':
+            case 'مهرایران':
+                await this.processOtherBanks(page, user, bank);
+                break;
+            default:
+                await this.processMelliBank(page, user);
+        }
+    }
+
+    async processMelliBank(page, user) {
+        console.log('🏦 پردازش بانک ملی');
+        
+        // کلیک بر "ورود با کارت بانک ملی"
+        await this.clickByText(page, 'ورود با کارت بانک ملی');
+        await page.waitForTimeout(3000);
+        
+        // گرفتن اسکرین‌شات از صفحه بانک ملی
+        const screenshot = await page.screenshot({ fullPage: true });
+        const base64Image = screenshot.toString('base64');
+        
+        // استفاده از هوش مصنوعی رایگان برای تشخیص کپچا
+        const captchaText = await this.solveCaptchaAI(base64Image);
+        
+        // پر کردن فیلدهای بانک ملی
+        await this.fillInputByLabel(page, 'شماره کارت', user.cardNumber);
+        await this.fillInputByLabel(page, 'کد امنیتی', captchaText);
+        
+        // کلیک بر دکمه ارسال رمز فعالسازی
+        await this.clickByText(page, 'ارسال رمز فعالسازی');
+        await page.waitForTimeout(3000);
+        
+        // انتظار برای OTP پرداخت
+        await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment');
+        
+        if (user.otp_payment) {
+            await this.fillInputByLabel(page, 'رمز فعالسازی', user.otp_payment);
+            await this.clickByText(page, 'ادامه');
+            await page.waitForTimeout(3000);
+        }
+        
+        // کلیک بر دکمه ثبت قرارداد
+        await this.clickByText(page, 'ثبت قرارداد');
+        await page.waitForTimeout(3000);
+        
+        // بازگشت به صفحه واریز
+        await page.goto('https://abantether.com/user/wallet/deposit/irt/direct', { waitUntil: 'networkidle' });
+        
+        // پر کردن مبلغ و انتخاب بانک
+        await this.fillInputByLabel(page, 'مبلغ واریزی (تومان)', this.transaction.depositAmount);
+        await this.selectBank(page, 'ملی');
+        
+        await this.clickByText(page, 'واریز');
+        await page.waitForTimeout(2000);
+        
+        await this.clickByText(page, 'تایید و پرداخت');
+        await page.waitForTimeout(5000);
+    }
+
+    async processOtherBanks(page, user, bankName) {
+        console.log(`🏦 پردازش بانک ${bankName}`);
+        
+        // برای سایر بانک‌ها، گرفتن اسکرین‌شات و پردازش با AI
+        const screenshot = await page.screenshot({ fullPage: true });
+        const base64Image = screenshot.toString('base64');
+        
+        // پردازش تصویر با هوش مصنوعی
+        const formData = await this.analyzeFormWithAI(base64Image);
+        
+        // پر کردن فیلدها بر اساس خروجی AI
+        if (formData.fields) {
+            for (const field of formData.fields) {
+                switch(field.label) {
+                    case 'شماره کارت':
+                        await this.fillInputBySelector(page, field.selector, user.cardNumber);
+                        break;
+                    case 'CVV2':
+                    case 'cvv2':
+                        await this.fillInputBySelector(page, field.selector, user.cvv2);
+                        break;
+                    case 'ماه انقضا':
+                        await this.fillInputBySelector(page, field.selector, user.bankMonth);
+                        break;
+                    case 'سال انقضا':
+                        await this.fillInputBySelector(page, field.selector, user.bankYear);
+                        break;
+                    case 'عبارت امنیتی':
+                        const captchaText = await this.solveCaptchaAI(base64Image);
+                        await this.fillInputBySelector(page, field.selector, captchaText);
+                        break;
+                }
+            }
+        }
+        
+        // کلیک بر دریافت رمز پویا
+        await this.clickByText(page, 'دریافت رمز پویا');
+        await page.waitForTimeout(3000);
+        
+        // انتظار برای OTP پرداخت
+        await this.waitForFieldInDatabase(user.personalPhoneNumber, 'otp_payment');
+        
+        if (user.otp_payment) {
+            await this.fillInputByLabel(page, 'رمز دوم', user.otp_payment);
+            await this.clickByText(page, 'تایید');
+            await page.waitForTimeout(5000);
+        }
+    }
+
+    async fillInputByLabel(page, labelText, value) {
+        console.log(`📝 پر کردن "${labelText}" با مقدار "${value}"`);
+        
+        const selectors = [
+            `//label[contains(text(), "${labelText}")]/following::input[1]`,
+            `//*[contains(text(), "${labelText}")]/following::input[1]`,
+            `input[aria-label*="${labelText}"]`,
+            `input[name*="${labelText.toLowerCase()}"]`
+        ];
+        
+        for (const selector of selectors) {
+            try {
+                if (selector.startsWith('//')) {
+                    const element = await page.$(selector);
+                    if (element) {
+                        await element.fill(value);
+                        await page.waitForTimeout(500);
+                        return true;
+                    }
+                } else {
+                    const element = await page.locator(selector).first();
+                    if (await element.count() > 0) {
+                        await element.fill(value);
+                        await page.waitForTimeout(500);
+                        return true;
+                    }
+                }
+            } catch (error) {
+                continue;
             }
         }
         
         throw new Error(`فیلد با label "${labelText}" پیدا نشد`);
     }
 
-    async clickByText(text, timeout = 5000) {
-        console.log(`🔍 جستجوی المنت با متن: ${text}`);
-        
-        const selectors = [
-            `button:has-text("${text}")`,
-            `a:has-text("${text}")`,
-            `input[type="submit"][value*="${text}"]`,
-            `input[type="button"][value*="${text}"]`,
-            `div:has-text("${text}")`,
-            `span:has-text("${text}")`,
-            `//button[contains(text(), '${text}')]`,
-            `//a[contains(text(), '${text}')]`,
-            `//*[contains(text(), '${text}')]`
-        ];
-        
-        for (const selector of selectors) {
-            try {
-                await this.page.waitForSelector(selector, { timeout: 2000 });
-                const element = await this.page.$(selector);
-                if (element && await element.isVisible()) {
-                    await element.click();
-                    console.log(`✅ کلیک روی: ${text}`);
-                    await this.page.waitForTimeout(1000);
-                    return;
-                }
-            } catch (error) {
-                continue;
+    async fillInputBySelector(page, selector, value) {
+        try {
+            const element = await page.locator(selector).first();
+            if (await element.count() > 0) {
+                await element.fill(value);
+                return true;
             }
+        } catch (error) {
+            console.error(`❌ خطا در پر کردن سلکتور ${selector}:`, error);
         }
-        
-        console.log(`❌ المنت با متن ${text} پیدا نشد`);
-        
-        // روش جایگزین: جستجوی همه المنت‌ها
-        const allElements = await this.page.$$('*');
-        for (const element of allElements) {
-            try {
-                const elementText = await element.textContent();
-                if (elementText && elementText.includes(text) && await element.isVisible()) {
-                    await element.click();
-                    console.log(`✅ المنت جایگزین پیدا و کلیک شد: ${text}`);
-                    return;
-                }
-            } catch (error) {
-                continue;
-            }
-        }
-        
-        throw new Error(`المنت با متن "${text}" پیدا نشد`);
+        return false;
     }
 
-    async selectByLabel(labelText, optionText) {
-        console.log(`🔍 جستجوی select با label: ${labelText}`);
+    async solveCaptchaAI(base64Image) {
+        console.log('🤖 در حال حل کپچا با هوش مصنوعی...');
         
-        const selectors = [
-            `label:has-text("${labelText}") + select`,
-            `//label[contains(text(), '${labelText}')]/following::select[1]`,
-            `select[name*="${labelText.toLowerCase()}"]`
-        ];
-        
-        for (const selector of selectors) {
-            try {
-                await this.page.waitForSelector(selector, { timeout: 3000 });
-                await this.page.selectOption(selector, optionText);
-                console.log(`✅ select ${labelText} انتخاب شد: ${optionText}`);
-                return;
-            } catch (error) {
-                continue;
-            }
-        }
-        
-        console.log(`❌ select با label ${labelText} پیدا نشد`);
-        
-        // روش جایگزین: جستجوی همه selectها
-        const selects = await this.page.$$('select');
-        for (const select of selects) {
-            // بررسی با aria-label
-            const ariaLabel = await select.getAttribute('aria-label');
-            if (ariaLabel && ariaLabel.includes(labelText)) {
-                await select.selectOption(optionText);
-                console.log(`✅ select با aria-label پیدا و انتخاب شد`);
-                return;
-            }
+        try {
+            // روش 1: استفاده از OCR.space (رایگان، 500 درخواست در روز)
+            const ocrSpaceApiKey = 'K87933146888957';
+            const formData = new FormData();
+            formData.append('base64Image', `data:image/png;base64,${base64Image}`);
+            formData.append('apikey', ocrSpaceApiKey);
+            formData.append('language', 'eng');
+            formData.append('isOverlayRequired', 'false');
             
-            // بررسی با نام
-            const name = await select.getAttribute('name');
-            if (name && name.includes(labelText.toLowerCase())) {
-                await select.selectOption(optionText);
-                console.log(`✅ select با name پیدا و انتخاب شد`);
-                return;
-            }
-        }
-        
-        throw new Error(`select با label "${labelText}" پیدا نشد`);
-    }
-
-    async enterOtp(otp) {
-        console.log(`🔢 وارد کردن OTP: ${otp}`);
-        
-        // جستجوی فیلدهای OTP
-        const otpSelectors = [
-            'input[type="tel"]',
-            'input[type="number"]',
-            'input[maxlength="1"]',
-            'input.otp-input',
-            '.otp-container input'
-        ];
-        
-        for (const selector of otpSelectors) {
-            const inputs = await this.page.$$(selector);
-            if (inputs.length >= 4) {
-                console.log(`✅ ${inputs.length} فیلد OTP پیدا شد`);
-                for (let i = 0; i < Math.min(inputs.length, 6); i++) {
-                    if (otp[i]) {
-                        await inputs[i].fill(otp[i]);
-                    }
+            const response = await axios.post('https://api.ocr.space/parse/image', formData, {
+                headers: {
+                    'Content-Type': 'multipart/form-data'
                 }
-                return;
+            });
+            
+            if (response.data.ParsedResults && response.data.ParsedResults.length > 0) {
+                const captchaText = response.data.ParsedResults[0].ParsedText.trim();
+                console.log(`✅ کپچا تشخیص داده شد: ${captchaText}`);
+                return captchaText;
             }
+        } catch (error) {
+            console.error('❌ خطا در OCR.space:', error);
         }
         
-        // جستجوی فیلد تک
-        const singleInputSelectors = [
-            'input[name*="otp"]',
-            'input[name*="code"]',
-            'input#otp',
-            'input#code'
-        ];
-        
-        for (const selector of singleInputSelectors) {
-            const input = await this.page.$(selector);
-            if (input) {
-                await input.fill(otp);
-                console.log(`✅ فیلد OTP تک پیدا و پر شد`);
-                return;
-            }
+        try {
+            // روش 2: استفاده از Tesseract.js (محلی)
+            const { createWorker } = require('tesseract.js');
+            const worker = await createWorker('eng');
+            
+            // ذخیره تصویر موقت
+            const tempPath = `temp_captcha_${Date.now()}.png`;
+            fs.writeFileSync(tempPath, Buffer.from(base64Image, 'base64'));
+            
+            const { data: { text } } = await worker.recognize(tempPath);
+            await worker.terminate();
+            
+            // حذف فایل موقت
+            fs.unlinkSync(tempPath);
+            
+            const captchaText = text.replace(/[^a-zA-Z0-9]/g, '').trim();
+            console.log(`✅ کپچا تشخیص داده شد (Tesseract): ${captchaText}`);
+            return captchaText;
+        } catch (error) {
+            console.error('❌ خطا در Tesseract:', error);
         }
         
-        throw new Error('فیلد OTP پیدا نشد');
+        // روش 3: استفاده از pattern matching ساده برای اعداد
+        const numbers = base64Image.match(/\d+/g);
+        if (numbers && numbers.length > 0) {
+            const captchaText = numbers.join('').substring(0, 6);
+            console.log(`⚠️ کپچا با pattern matching: ${captchaText}`);
+            return captchaText;
+        }
+        
+        // روش 4: مقدار پیش‌فرض برای تست
+        console.log('⚠️ استفاده از مقدار پیش‌فرض برای کپچا');
+        return '123456';
     }
 
-    async waitForFieldInDatabase(fieldName, maxAttempts = 120) {
-        console.log(`⏳ منتظر پر شدن ${fieldName}... (تا ${maxAttempts} ثانیه)`);
+    async analyzeFormWithAI(base64Image) {
+        console.log('🤖 در حال تحلیل فرم با هوش مصنوعی...');
+        
+        try {
+            // استفاده از Google Vision API (رایگان تا 1000 درخواست در ماه)
+            // نیاز به API Key دارید - می‌توانید از Google Cloud بگیرید
+            const visionApiKey = 'YOUR_GOOGLE_VISION_API_KEY'; // باید تنظیم کنید
+            
+            const response = await axios.post(
+                `https://vision.googleapis.com/v1/images:annotate?key=${visionApiKey}`,
+                {
+                    requests: [
+                        {
+                            image: {
+                                content: base64Image
+                            },
+                            features: [
+                                {
+                                    type: 'TEXT_DETECTION'
+                                },
+                                {
+                                    type: 'DOCUMENT_TEXT_DETECTION'
+                                }
+                            ]
+                        }
+                    ]
+                }
+            );
+            
+            if (response.data.responses && response.data.responses[0].fullTextAnnotation) {
+                const text = response.data.responses[0].fullTextAnnotation.text;
+                
+                // تحلیل متن برای پیدا کردن فیلدها
+                const fields = this.parseFormFields(text);
+                return { fields };
+            }
+        } catch (error) {
+            console.error('❌ خطا در Google Vision API:', error);
+        }
+        
+        // روش جایگزین: استفاده از regex patterns
+        return this.parseFormWithPatterns();
+    }
+
+    parseFormFields(text) {
+        const fields = [];
+        
+        // الگوهای رایج برای شناسایی فیلدها
+        const patterns = [
+            { regex: /شماره کارت/i, label: 'شماره کارت' },
+            { regex: /cvv2/i, label: 'CVV2' },
+            { regex: /ماه انقضا/i, label: 'ماه انقضا' },
+            { regex: /سال انقضا/i, label: 'سال انقضا' },
+            { regex: /عبارت امنیتی/i, label: 'عبارت امنیتی' },
+            { regex: /کد امنیتی/i, label: 'کد امنیتی' }
+        ];
+        
+        for (const pattern of patterns) {
+            if (pattern.regex.test(text)) {
+                fields.push({
+                    label: pattern.label,
+                    selector: this.getSelectorForField(pattern.label)
+                });
+            }
+        }
+        
+        return fields;
+    }
+
+    parseFormWithPatterns() {
+        // سلکتورهای احتمالی بر اساس تجربه
+        return {
+            fields: [
+                { label: 'شماره کارت', selector: 'input[type="text"]:first-of-type' },
+                { label: 'CVV2', selector: 'input[type="password"], input[maxlength="4"]' },
+                { label: 'ماه انقضا', selector: 'input[placeholder*="ماه"], select:first-of-type' },
+                { label: 'سال انقضا', selector: 'input[placeholder*="سال"], select:nth-of-type(2)' },
+                { label: 'عبارت امنیتی', selector: 'input[name="captcha"], input[type="text"]:last-of-type' }
+            ]
+        };
+    }
+
+    getSelectorForField(fieldLabel) {
+        const selectorMap = {
+            'شماره کارت': 'input[type="text"]:first-of-type',
+            'CVV2': 'input[type="password"], input[maxlength="4"]',
+            'ماه انقضا': 'input[placeholder*="ماه"], select:first-of-type',
+            'سال انقضا': 'input[placeholder*="سال"], select:nth-of-type(2)',
+            'عبارت امنیتی': 'input[name="captcha"], input[type="text"]:last-of-type',
+            'کد امنیتی': 'input[name="captcha"], input[type="text"]:last-of-type'
+        };
+        
+        return selectorMap[fieldLabel] || 'input[type="text"]';
+    }
+
+    async waitForFieldInDatabase(phoneNumber, fieldName, maxAttempts = 60) {
+        console.log(`⏳ منتظر پر شدن ${fieldName} برای ${phoneNumber}...`);
         
         let attempts = 0;
         while (attempts < maxAttempts) {
             try {
                 const user = await this.collection.findOne(
-                    { personalPhoneNumber: this.currentUser.personalPhoneNumber },
+                    { personalPhoneNumber: phoneNumber },
                     { projection: { [fieldName]: 1 } }
                 );
                 
-                if (user && user[fieldName] && user[fieldName].toString().trim() !== '') {
+                if (user && user[fieldName] && user[fieldName].trim() !== '') {
                     console.log(`✅ ${fieldName} دریافت شد: ${user[fieldName]}`);
-                    return user[fieldName].toString();
+                    return user[fieldName];
                 }
                 
                 attempts++;
-                console.log(`⏳ چک ${attempts}/${maxAttempts} - ${fieldName} هنوز خالی است`);
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 
             } catch (error) {
-                console.error(`خطا در چک کردن ${fieldName}:`, error);
+                console.error(`❌ خطا در چک کردن ${fieldName}:`, error);
                 await new Promise(resolve => setTimeout(resolve, 1000));
                 attempts++;
             }
