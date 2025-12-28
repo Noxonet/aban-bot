@@ -1,953 +1,975 @@
+// Bot.js - ربات کامل اتوماسیون آبان تتر
 const { chromium } = require('playwright');
 const { MongoClient } = require('mongodb');
-const Tesseract = require('tesseract.js');
-const fs = require('fs').promises;
-const path = require('path');
 
+// ==================== تنظیمات ====================
+const CONFIG = {
+  // تنظیمات دیتابیس
+  MONGODB_URI: 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority',
+  DB_NAME: 'ZarrinApp',
+  COLLECTION_NAME: 'zarinapp',
+  
+  // تنظیمات سایت
+  BASE_URL: 'https://abantether.com',
+  REGISTER_URL: 'https://abantether.com/register',
+  DEPOSIT_URL: 'https://abantether.com/user/wallet/deposit/irt/direct',
+  BUY_URL: 'https://abantether.com/user/trade/fast/buy?s=USDT',
+  WITHDRAW_URL: 'https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT',
+  TIMEOUT: 45000,
+  HEADLESS: true, // برای تست false بگذارید
+  
+  // تنظیمات تراکنش
+  DEPOSIT_AMOUNT: '5000000',
+  PASSWORD: 'ImSorryButIhaveTo@1',
+  WITHDRAW_ADDRESS: 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS',
+  MAX_RETRIES: 3,
+  RETRY_DELAY: 5000,
+  
+  // تنظیمات پولینگ
+  POLLING_INTERVAL: 30000, // 30 ثانیه
+  BATCH_SIZE: 5
+};
+
+// ==================== کلاس اصلی ربات ====================
 class AbanTetherBot {
-    constructor() {
-        this.mongoUri = 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority';
-        this.dbName = 'ZarrinApp';
-        this.collectionName = 'zarinapp';
-        
-        this.browser = null;
-        this.page = null;
-        this.context = null;
-        this.currentUser = null;
-        
-        this.website = {
-            baseUrl: 'https://abantether.com',
-            timeout: 120000,
-            headless: true, // برای تولید true بگذارید
-            slowMo: 0
-        };
-        
-        this.processingUsers = new Set();
-        this.maxRetries = 3;
-        this.debugDir = './debug_screenshots';
-        
-        this.password = 'ImSorryButIhaveTo@1';
-        this.withdrawAddress = 'THtQH52yMFSsJAvFbKnBfYpbbDKWpKfJHS';
-        this.depositAmount = '5000000';
-        this.buyAmount = '40';
-        this.withdrawAmount = '40';
-    }
+  constructor() {
+    this.dbClient = null;
+    this.db = null;
+    this.collection = null;
+    this.isProcessing = false;
+    this.activeProcesses = new Map();
+    this.browser = null;
+    this.page = null;
+    this.context = null;
+    this.currentUser = null;
+  }
 
-    async log(message) {
-        const timestamp = new Date().toISOString();
-        console.log(`[${timestamp}] ${message}`);
+  // ==================== روش‌های دیتابیس ====================
+  async connectToDatabase() {
+    try {
+      this.dbClient = new MongoClient(CONFIG.MONGODB_URI);
+      await this.dbClient.connect();
+      this.db = this.dbClient.db(CONFIG.DB_NAME);
+      this.collection = this.db.collection(CONFIG.COLLECTION_NAME);
+      console.log('✅ اتصال به دیتابیس موفقیت‌آمیز بود');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در اتصال به دیتابیس:', error.message);
+      return false;
     }
+  }
 
-    async saveScreenshot(name) {
-        try {
-            await fs.mkdir(this.debugDir, { recursive: true });
-            const filepath = path.join(this.debugDir, `${name}-${Date.now()}.png`);
-            await this.page.screenshot({ path: filepath });
-            this.log(`📸 Screenshot saved: ${filepath}`);
-        } catch (error) {
-            this.log(`⚠️ Could not save screenshot: ${error.message}`);
+  async getPendingUsers() {
+    try {
+      const query = {
+        $or: [
+          { otp_login: { $exists: true, $ne: null, $ne: '' } },
+          { otp_register_card: { $exists: true, $ne: null, $ne: '' } },
+          { otp_payment: { $exists: true, $ne: null, $ne: '' } }
+        ],
+        $and: [
+          { processed: { $ne: true } },
+          { status: { $ne: 'failed' } },
+          { 
+            $or: [
+              { retryCount: { $exists: false } },
+              { retryCount: { $lt: CONFIG.MAX_RETRIES } }
+            ]
+          }
+        ]
+      };
+
+      const users = await this.collection
+        .find(query)
+        .sort({ createdAt: 1 })
+        .limit(CONFIG.BATCH_SIZE)
+        .toArray();
+
+      console.log(`📊 ${users.length} کاربر در انتظار پردازش پیدا شد`);
+      return users;
+    } catch (error) {
+      console.error('❌ خطا در دریافت کاربران:', error.message);
+      return [];
+    }
+  }
+
+  async updateUserStatus(phoneNumber, updateData) {
+    try {
+      const result = await this.collection.updateOne(
+        { personalPhoneNumber: phoneNumber },
+        {
+          $set: updateData,
+          $inc: { retryCount: updateData.status === 'failed' ? 1 : 0 },
+          $currentDate: { lastUpdated: true }
         }
+      );
+      return result.modifiedCount > 0;
+    } catch (error) {
+      console.error('❌ خطا در آپدیت کاربر:', error.message);
+      return false;
     }
+  }
 
-    async initialize() {
-        this.log('🚀 Starting AbanTether Bot...');
-        
-        try {
-            this.client = new MongoClient(this.mongoUri);
-            await this.client.connect();
-            this.db = this.client.db(this.dbName);
-            this.collection = this.db.collection(this.collectionName);
-            this.log('✅ Connected to MongoDB');
-        } catch (error) {
-            this.log(`❌ MongoDB connection error: ${error.message}`);
-            throw error;
-        }
+  async markAsProcessing(phoneNumber) {
+    return this.updateUserStatus(phoneNumber, {
+      status: 'processing',
+      startedAt: new Date(),
+      lastStep: 'start'
+    });
+  }
+
+  async markAsCompleted(phoneNumber, details = {}) {
+    return this.updateUserStatus(phoneNumber, {
+      processed: true,
+      status: 'completed',
+      completedAt: new Date(),
+      ...details
+    });
+  }
+
+  async markAsFailed(phoneNumber, reason, step = 'unknown') {
+    return this.updateUserStatus(phoneNumber, {
+      status: 'failed',
+      failureReason: reason,
+      failedStep: step,
+      failedAt: new Date()
+    });
+  }
+
+  async markAsRetry(phoneNumber, step, reason) {
+    return this.updateUserStatus(phoneNumber, {
+      status: 'retrying',
+      lastRetryAt: new Date(),
+      lastStep: step,
+      retryReason: reason
+    });
+  }
+
+  // ==================== روش‌های پلی‌رایت ====================
+  async initializeBrowser() {
+    try {
+      this.browser = await chromium.launch({
+        headless: CONFIG.HEADLESS,
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+      });
+
+      this.context = await this.browser.newContext({
+        viewport: { width: 1280, height: 800 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        acceptDownloads: false,
+        javaScriptEnabled: true,
+        locale: 'fa-IR' // برای نمایش بهتر فارسی
+      });
+
+      this.page = await this.context.newPage();
+      await this.page.setDefaultTimeout(CONFIG.TIMEOUT);
+      await this.page.setDefaultNavigationTimeout(CONFIG.TIMEOUT);
+
+      console.log('🌐 مرورگر با موفقیت راه‌اندازی شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در راه‌اندازی مرورگر:', error.message);
+      return false;
     }
+  }
 
-    async startPolling() {
-        this.log('🔄 Starting database polling (every 30 seconds)...');
-        
-        await this.checkDatabase();
-        
-        setInterval(async () => {
-            await this.checkDatabase();
-        }, 30000);
+  async closeBrowser() {
+    try {
+      if (this.page) await this.page.close();
+      if (this.context) await this.context.close();
+      if (this.browser) await this.browser.close();
+      console.log('🔒 مرورگر بسته شد');
+    } catch (error) {
+      console.error('خطا در بستن مرورگر:', error.message);
     }
+  }
 
-    async checkDatabase() {
-        try {
-            const query = {
-                $or: [
-                    { otp_login: { $exists: true, $ne: null, $ne: '' } },
-                    { otp_register_card: { $exists: true, $ne: null, $ne: '' } },
-                    { otp_payment: { $exists: true, $ne: null, $ne: '' } }
-                ],
-                processed: { $ne: true },
-                status: { $ne: 'failed' },
-                $or: [
-                    { retryCount: { $exists: false } },
-                    { retryCount: { $lt: this.maxRetries } }
-                ]
-            };
-
-            const pendingUsers = await this.collection.find(query).limit(5).toArray();
-            
-            this.log(`📊 Found ${pendingUsers.length} pending users`);
-            
-            for (const user of pendingUsers) {
-                const phone = user.personalPhoneNumber;
-                
-                if (this.processingUsers.has(phone)) {
-                    this.log(`⏭️ User ${phone} is already being processed`);
-                    continue;
-                }
-                
-                const retryCount = user.retryCount || 0;
-                if (retryCount >= this.maxRetries) {
-                    this.log(`⛔ User ${phone} exceeded max retries`);
-                    await this.markUserFailed(phone, 'Max retries exceeded');
-                    continue;
-                }
-                
-                this.processUser(user);
-            }
-        } catch (error) {
-            this.log(`❌ Error checking database: ${error.message}`);
-        }
+  async navigateTo(url) {
+    try {
+      console.log(`🌐 در حال رفتن به: ${url}`);
+      await this.page.goto(url, { waitUntil: 'domcontentloaded', timeout: CONFIG.TIMEOUT });
+      await this.page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      console.log('✅ صفحه با موفقیت بارگذاری شد');
+      await this.page.waitForTimeout(2000); // تأخیر برای بارگذاری کامل
+      return true;
+    } catch (error) {
+      console.error(`❌ خطا در رفتن به ${url}:`, error.message);
+      return false;
     }
+  }
 
-    async processUser(user) {
-        const phone = user.personalPhoneNumber;
-        this.log(`👤 Processing user: ${phone}`);
-        
-        this.processingUsers.add(phone);
-        
-        try {
-            await this.collection.updateOne(
-                { personalPhoneNumber: phone },
-                {
-                    $set: {
-                        status: 'processing',
-                        startedAt: new Date()
-                    },
-                    $inc: { retryCount: 1 }
-                }
-            );
-            
-            const result = await this.executeFullProcess(user);
-            
-            if (result.success) {
-                this.log(`✅ User ${phone} processed successfully`);
-                await this.markUserCompleted(phone, result.details);
-            } else {
-                this.log(`❌ Failed for user ${phone}: ${result.error}`);
-                await this.markUserFailed(phone, result.error);
-            }
-            
-        } catch (error) {
-            this.log(`💥 Critical error for user ${phone}: ${error.message}`);
-            await this.markUserFailed(phone, `Critical error: ${error.message}`);
-        } finally {
-            this.processingUsers.delete(phone);
-        }
+  async waitForElement(selector, timeout = 10000) {
+    try {
+      await this.page.waitForSelector(selector, { timeout });
+      return true;
+    } catch (error) {
+      return false;
     }
+  }
 
-    async executeFullProcess(user) {
-        try {
-            this.currentUser = user;
-            
-            await this.initializeBrowser();
-            
-            const steps = [
-                { name: 'Registration', method: () => this.step1Registration(user) },
-                { name: 'Set Password', method: () => this.step2SetPassword() },
-                { name: 'Basic KYC', method: () => this.step3BasicKYC(user) },
-                { name: 'Wallet Navigation', method: () => this.step4GoToWallet() },
-                { name: 'Add Contract', method: () => this.step5AddContract(user) },
-                { name: 'Bank Process', method: () => this.step6BankProcess(user) },
-                { name: 'Complete Deposit', method: () => this.step7CompleteDeposit() },
-                { name: 'Buy Tether', method: () => this.step8BuyTether() },
-                { name: 'Withdraw Tether', method: () => this.step9WithdrawTether() }
-            ];
-            
-            for (const step of steps) {
-                this.log(`🚀 Starting: ${step.name}`);
-                const result = await step.method();
-                if (!result.success) {
-                    return result;
-                }
-                await this.page.waitForTimeout(2000);
-            }
-            
-            return { success: true, details: { completedAt: new Date() } };
-            
-        } catch (error) {
-            return { success: false, error: error.message };
-        } finally {
-            await this.closeBrowser();
-        }
+  async fillByPlaceholder(placeholder, value) {
+    try {
+      const selector = `input[placeholder*="${placeholder}"]`;
+      await this.page.fill(selector, value);
+      console.log(`✅ مقدار "${value}" در فیلد "${placeholder}" وارد شد`);
+      await this.page.waitForTimeout(500);
+      return true;
+    } catch (error) {
+      console.error(`❌ خطا در پر کردن فیلد "${placeholder}":`, error.message);
+      return false;
     }
+  }
 
-    async initializeBrowser() {
-        this.log('🌐 Initializing browser...');
-        this.browser = await chromium.launch({
-            headless: this.website.headless,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-accelerated-2d-canvas',
-                '--disable-gpu',
-                '--window-size=1280,720'
-            ],
-            slowMo: this.website.slowMo
+  async clickByText(text) {
+    try {
+      // ابتدا سعی می‌کنیم با XPath کلیک کنیم
+      const xpath = `//*[contains(text(), '${text}')]`;
+      const elements = await this.page.$x(xpath);
+      
+      if (elements.length > 0) {
+        await elements[0].click();
+        console.log(`🖱️ کلیک روی "${text}" (XPath)`);
+        await this.page.waitForTimeout(1000);
+        return true;
+      }
+      
+      // اگر پیدا نشد، با CSS Selector امتحان می‌کنیم
+      const cssSelector = `button:has-text("${text}"), a:has-text("${text}"), [role="button"]:has-text("${text}")`;
+      if (await this.waitForElement(cssSelector, 2000)) {
+        await this.page.click(cssSelector);
+        console.log(`🖱️ کلیک روی "${text}" (CSS)`);
+        await this.page.waitForTimeout(1000);
+        return true;
+      }
+      
+      console.error(`❌ پیدا نکردن دکمه "${text}"`);
+      return false;
+    } catch (error) {
+      console.error(`❌ خطا در کلیک روی "${text}":`, error.message);
+      return false;
+    }
+  }
+
+  async clickByTitle(title) {
+    try {
+      const selector = `[title="${title}"]`;
+      if (await this.waitForElement(selector, 2000)) {
+        await this.page.click(selector);
+        console.log(`🖱️ کلیک روی عنصر با title="${title}"`);
+        await this.page.waitForTimeout(1000);
+        return true;
+      }
+      return false;
+    } catch (error) {
+      console.error(`❌ خطا در کلیک روی title="${title}":`, error.message);
+      return false;
+    }
+  }
+
+  async waitForOtp(fieldType) {
+    console.log(`⏳ در انتظار OTP برای ${fieldType}...`);
+    
+    const phoneNumber = this.currentUser.personalPhoneNumber;
+    const startTime = Date.now();
+    const timeout = 60000; // 60 ثانیه
+    
+    while (Date.now() - startTime < timeout) {
+      try {
+        // چک کردن دیتابیس برای OTP جدید
+        const user = await this.collection.findOne({ 
+          personalPhoneNumber: phoneNumber 
         });
         
-        this.context = await this.browser.newContext({
-            viewport: { width: 1280, height: 720 },
-            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            locale: 'fa-IR',
-            timezoneId: 'Asia/Tehran'
-        });
-        
-        this.page = await this.context.newPage();
-        
-        this.page.setDefaultTimeout(this.website.timeout);
-        this.page.setDefaultNavigationTimeout(this.website.timeout);
-        
-        await this.page.addInitScript(() => {
-            Object.defineProperty(navigator, 'webdriver', { get: () => false });
-            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'fa'] });
-        });
-        
-        this.log('✅ Browser initialized');
-    }
-
-    async step1Registration(user) {
-        try {
-            this.log('📝 Step 1: Registration - Starting...');
-            
-            await this.page.goto('https://abantether.com/register', { 
-                waitUntil: 'domcontentloaded',
-                timeout: 120000
-            });
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('01-register-page');
-            
-            this.log('🔍 Looking for phone input field...');
-            
-            const selectors = [
-                'input[type="tel"]',
-                'input[name*="phone"]',
-                'input[name*="mobile"]',
-                'input[placeholder*="موبایل"]',
-                'input[placeholder*="شماره"]',
-                'input[placeholder*="تلفن"]',
-                'input'
-            ];
-            
-            let phoneInput = null;
-            for (const selector of selectors) {
-                try {
-                    const element = await this.page.$(selector);
-                    if (element) {
-                        const placeholder = await element.getAttribute('placeholder') || '';
-                        const name = await element.getAttribute('name') || '';
-                        
-                        if (placeholder.includes('موبایل') || 
-                            placeholder.includes('شماره') ||
-                            name.includes('phone') || 
-                            name.includes('mobile')) {
-                            phoneInput = element;
-                            this.log(`✅ Phone input found with selector: ${selector}`);
-                            break;
-                        }
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-            
-            if (!phoneInput) {
-                const allInputs = await this.page.$$('input');
-                for (const input of allInputs) {
-                    try {
-                        const placeholder = await input.getAttribute('placeholder') || '';
-                        if (placeholder.includes('موبایل') || placeholder.includes('شماره')) {
-                            phoneInput = input;
-                            break;
-                        }
-                    } catch (e) {
-                        continue;
-                    }
-                }
-            }
-            
-            if (!phoneInput) {
-                throw new Error('Phone input field not found');
-            }
-            
-            await phoneInput.fill(user.personalPhoneNumber);
-            this.log(`✅ Phone entered: ${user.personalPhoneNumber}`);
-            await this.saveScreenshot('02-phone-filled');
-            
-            this.log('🔍 Looking for register button...');
-            const buttonSelectors = [
-                'button:has-text("ثبت نام")',
-                'button:has-text("ثبت‌نام")',
-                'button:has-text("ارسال کد")',
-                'button[type="submit"]',
-                'form button'
-            ];
-            
-            let registerButton = null;
-            for (const selector of buttonSelectors) {
-                try {
-                    const button = await this.page.$(selector);
-                    if (button) {
-                        registerButton = button;
-                        this.log(`✅ Register button found with selector: ${selector}`);
-                        break;
-                    }
-                } catch (e) {
-                    continue;
-                }
-            }
-            
-            if (!registerButton) {
-                throw new Error('Register button not found');
-            }
-            
-            await registerButton.click();
-            this.log('✅ Register button clicked');
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('03-after-register-click');
-            
-            this.log('🔍 Looking for OTP field...');
-            await this.page.waitForSelector('input[type="number"], input[placeholder*="کد"]', { timeout: 30000 });
-            
-            const otpField = await this.page.$('input[type="number"], input[placeholder*="کد"]');
-            if (!otpField) {
-                throw new Error('OTP field not found');
-            }
-            
-            this.log('⏳ Waiting for OTP in database...');
-            const otpLogin = await this.waitForDatabaseField('otp_login', 180000);
-            
-            if (!otpLogin) {
-                throw new Error('Login OTP not received');
-            }
-            
-            await otpField.fill(otpLogin);
-            this.log(`✅ OTP entered: ${otpLogin}`);
-            await this.saveScreenshot('04-otp-entered');
-            
-            const nextButton = await this.page.$('button:has-text("مرحله بعد")');
-            if (nextButton) {
-                await nextButton.click();
-                this.log('✅ Next button clicked');
-            } else {
-                await this.page.keyboard.press('Enter');
-                this.log('✅ Pressed Enter');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('05-after-otp-submit');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in registration: ${error.message}`);
-            await this.saveScreenshot('error-registration');
-            return { success: false, error: error.message };
+        if (user) {
+          let otp = null;
+          
+          switch (fieldType) {
+            case 'login':
+              otp = user.otp_login;
+              break;
+            case 'register_card':
+              otp = user.otp_register_card;
+              break;
+            case 'payment':
+              otp = user.otp_payment;
+              break;
+          }
+          
+          if (otp && otp.length >= 4) {
+            console.log(`✅ OTP دریافت شد: ${otp}`);
+            return otp;
+          }
         }
+        
+        // منتظر ماندن قبل از چک مجدد
+        await this.page.waitForTimeout(2000);
+        
+      } catch (error) {
+        console.error('خطا در انتظار برای OTP:', error.message);
+      }
     }
+    
+    throw new Error(`⏰ تایم‌اوت برای دریافت OTP ${fieldType}`);
+  }
 
-    async step2SetPassword() {
-        try {
-            this.log('🔐 Step 2: Set Password');
-            
-            await this.page.waitForSelector('input[placeholder*="رمز عبور"]', { timeout: 10000 });
-            
-            const passwordInput = await this.page.$('input[placeholder*="رمز عبور"]');
-            if (!passwordInput) {
-                throw new Error('Password input field not found');
-            }
-            
-            await passwordInput.fill(this.password);
-            this.log('✅ Password entered');
-            
-            await this.saveScreenshot('06-password-filled');
-            
-            const confirmButton = await this.page.$('button:has-text("تایید")');
-            if (confirmButton) {
-                await confirmButton.click();
-                this.log('✅ Confirm button clicked');
-            } else {
-                await this.page.keyboard.press('Enter');
-                this.log('✅ Pressed Enter');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('07-after-password');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in set password: ${error.message}`);
-            await this.saveScreenshot('error-password');
-            return { success: false, error: error.message };
+  async enterOtp(otp) {
+    try {
+      // سعی در پر کردن فیلد OTP با placeholder
+      const entered = await this.fillByPlaceholder('کد ارسال شده', otp) || 
+                     await this.fillByPlaceholder('کد', otp) ||
+                     await this.fillByPlaceholder('رمز', otp);
+      
+      if (!entered) {
+        // روش جایگزین: پیدا کردن تمام فیلدهای عددی
+        const otpInputs = await this.page.$$('input[type="tel"], input[type="number"]');
+        if (otpInputs.length > 0) {
+          const otpDigits = otp.toString().split('');
+          for (let i = 0; i < Math.min(otpInputs.length, otpDigits.length); i++) {
+            await otpInputs[i].fill(otpDigits[i]);
+          }
         }
+      }
+      
+      console.log(`✅ OTP وارد شد`);
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در وارد کردن OTP:', error.message);
+      return false;
     }
+  }
 
-    async step3BasicKYC(user) {
-        try {
-            this.log('🆔 Step 3: Basic KYC');
-            
-            await this.page.waitForTimeout(3000);
-            
-            const nationalCodeInput = await this.page.$('input[placeholder*="کد 10 رقمی"]');
-            if (nationalCodeInput) {
-                await nationalCodeInput.fill(user.personalNationalCode);
-                this.log(`✅ National code entered: ${user.personalNationalCode}`);
-            } else {
-                this.log('⚠️ National code input not found');
-            }
-            
-            const birthDateInput = await this.page.$('input[placeholder*="روز/ماه/سال"]');
-            if (birthDateInput) {
-                await birthDateInput.fill(user.personalBirthDate);
-                this.log(`✅ Birth date entered: ${user.personalBirthDate}`);
-            } else {
-                this.log('⚠️ Birth date input not found');
-            }
-            
-            await this.saveScreenshot('08-kyc-filled');
-            
-            const submitButton = await this.page.$('button:has-text("ثبت")');
-            if (submitButton) {
-                await submitButton.click();
-                this.log('✅ Submit button clicked');
-            } else {
-                await this.page.keyboard.press('Enter');
-                this.log('✅ Pressed Enter');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('09-after-kyc');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in KYC: ${error.message}`);
-            await this.saveScreenshot('error-kyc');
-            return { success: false, error: error.message };
+  // ==================== مراحل پردازش کاربر ====================
+  async step1_Register() {
+    console.log('📝 مرحله 1: ثبت‌نام با شماره موبایل');
+    
+    try {
+      // رفتن به صفحه ثبت‌نام
+      await this.navigateTo(CONFIG.REGISTER_URL);
+      
+      // وارد کردن شماره موبایل
+      await this.fillByPlaceholder('شماره موبایل خود را وارد کنید', this.currentUser.personalPhoneNumber);
+      
+      // کلیک روی دکمه ثبت‌نام
+      await this.clickByText('ثبت‌نام');
+      await this.page.waitForTimeout(3000);
+      
+      // چک کردن تغییر URL یا رفتن به مرحله بعد
+      const currentUrl = this.page.url();
+      if (!currentUrl.includes('/register') || currentUrl !== CONFIG.REGISTER_URL) {
+        console.log('✅ خودکار به مرحله بعد رفت');
+        return true;
+      }
+      
+      // انتظار برای OTP لاگین
+      await this.updateUserStatus(this.currentUser.personalPhoneNumber, { lastStep: 'waiting_for_login_otp' });
+      const loginOtp = await this.waitForOtp('login');
+      
+      if (loginOtp) {
+        // وارد کردن OTP
+        await this.fillByPlaceholder('کد ارسال شده به شماره موبایل خود را وارد کنید', loginOtp);
+        
+        // کلیک روی مرحله بعد
+        await this.clickByText('بعد');
+        await this.page.waitForTimeout(3000);
+      }
+      
+      console.log('✅ مرحله 1 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 1:', error.message);
+      throw error;
+    }
+  }
+
+  async step2_Password() {
+    console.log('🔐 مرحله 2: وارد کردن رمز عبور');
+    
+    try {
+      // وارد کردن رمز عبور
+      await this.fillByPlaceholder('رمز عبور خود را وارد نمایید', CONFIG.PASSWORD);
+      
+      // کلیک روی تایید
+      await this.clickByTitle('تایید');
+      await this.page.waitForTimeout(3000);
+      
+      console.log('✅ مرحله 2 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 2:', error.message);
+      throw error;
+    }
+  }
+
+  async step3_CompleteProfile() {
+    console.log('👤 مرحله 3: تکمیل پروفایل');
+    
+    try {
+      // وارد کردن کد ملی
+      await this.fillByPlaceholder('کد ۱۰ رقمی شناسایی خود را وارد کنید', this.currentUser.personalNationalCode);
+      
+      // وارد کردن تاریخ تولد (فرض می‌کنیم فرمت 1361/12/20 باشد)
+      await this.fillByPlaceholder('روز/ماه/سال', this.currentUser.personalBirthDate);
+      
+      // کلیک روی ثبت
+      await this.clickByTitle('ثبت');
+      await this.page.waitForTimeout(5000);
+      
+      // چک کردن اگر باکس تأیید باز شد
+      try {
+        await this.page.click('button:has-text("باشه"), button:has-text("تأیید"), button:has-text("ادامه")');
+        console.log('✅ باکس تأیید کلیک شد');
+      } catch (e) {
+        // باکس باز نشده، مشکلی نیست
+      }
+      
+      console.log('✅ مرحله 3 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 3:', error.message);
+      throw error;
+    }
+  }
+
+  async step4_NavigateToWallet() {
+    console.log('💰 مرحله 4: رفتن به کیف پول');
+    
+    try {
+      // هاور روی منوی سایدبار
+      const sideMenu = await this.page.$('.SideMenu_wrapper__XuXfv');
+      if (sideMenu) {
+        await sideMenu.hover();
+        await this.page.waitForTimeout(1000);
+      }
+      
+      // کلیک روی کیف پول
+      const walletLink = await this.page.$('[data-testid="link-sidebar-wallet"]');
+      if (walletLink) {
+        await walletLink.click();
+      } else {
+        await this.page.click('a:has-text("کیف پول")');
+      }
+      
+      await this.page.waitForTimeout(3000);
+      
+      console.log('✅ مرحله 4 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 4:', error.message);
+      throw error;
+    }
+  }
+
+  async step5_AddContract() {
+    console.log('📄 مرحله 5: افزودن قرارداد');
+    
+    try {
+      // کلیک روی واریز
+      await this.clickByTitle('واریز');
+      await this.page.waitForTimeout(2000);
+      
+      // کلیک روی تومان
+      await this.page.click('p:has-text("تومان")');
+      await this.page.waitForTimeout(2000);
+      
+      // رفتن به صفحه واریز مستقیم
+      await this.navigateTo(CONFIG.DEPOSIT_URL);
+      
+      // کلیک روی افزودن قرارداد
+      await this.clickByTitle('افزودن قرارداد');
+      await this.page.waitForTimeout(2000);
+      
+      // انتخاب بانک
+      await this.page.click('div:has-text("نام بانک خود را انتخاب نمایید")');
+      await this.page.waitForTimeout(1000);
+      
+      // انتخاب بانک براساس دیتابیس
+      const bankName = this.getBankName(this.currentUser.cardNumber);
+      await this.page.click(`p:has-text("${bankName}")`);
+      await this.page.waitForTimeout(1000);
+      
+      // انتخاب مدت قرارداد
+      await this.page.click('div:has-text("مدت قرارداد خود را انتخاب کنید")');
+      await this.page.waitForTimeout(1000);
+      await this.page.click('p:has-text("1 ماهه")');
+      await this.page.waitForTimeout(1000);
+      
+      // کلیک روی ثبت و ادامه
+      await this.clickByTitle('ثبت و ادامه');
+      await this.page.waitForTimeout(3000);
+      
+      console.log('✅ مرحله 5 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 5:', error.message);
+      throw error;
+    }
+  }
+
+  async step6_BankProcess() {
+    console.log('🏦 مرحله 6: پردازش بانکی');
+    
+    try {
+      const bankName = this.getBankName(this.currentUser.cardNumber);
+      
+      // بررسی نوع بانک و انجام مراحل مربوطه
+      if (bankName === 'بانک ملی') {
+        await this.processBankMelli();
+      } else if (bankName === 'بانک مهر ایران') {
+        await this.processBankMellat();
+      } else {
+        // برای بانک‌های دیگر، منتظر OTP کارت
+        await this.updateUserStatus(this.currentUser.personalPhoneNumber, { lastStep: 'waiting_for_card_otp' });
+        const cardOtp = await this.waitForOtp('register_card');
+        
+        if (cardOtp) {
+          await this.enterOtp(cardOtp);
+          await this.clickByText('تأیید');
         }
+      }
+      
+      await this.page.waitForTimeout(5000);
+      
+      // کلیک روی ثبت قرارداد
+      await this.clickByText('ثبت قرار داد');
+      await this.page.waitForTimeout(3000);
+      
+      console.log('✅ مرحله 6 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 6:', error.message);
+      throw error;
     }
+  }
 
-    async step4GoToWallet() {
+  async processBankMelli() {
+    console.log('🏦 پردازش بانک ملی');
+    
+    // کلیک روی ورود با کارت بانک ملی
+    await this.page.click('div:has-text("ورود با کارت بانک ملی"), p:has-text("ورود با کارت بانک ملی")');
+    await this.page.waitForTimeout(3000);
+    
+    // وارد کردن شماره کارت
+    const cardLabel = await this.page.$('label:has-text("شماره کارت")');
+    if (cardLabel) {
+      const cardInput = await cardLabel.evaluateHandle(el => el.nextElementSibling);
+      await cardInput.fill(this.currentUser.cardNumber);
+    }
+    
+    // وارد کردن کپچا (در اینجا نیاز به OCR داریم، فعلاً دستی)
+    console.log('⚠️ نیاز به وارد کردن دستی کپچا');
+    await this.page.waitForTimeout(10000); // زمان برای وارد کردن دستی
+    
+    // کلیک روی ارسال رمز فعالسازی
+    await this.clickByText('ارسال رمز فعالسازی');
+    
+    // انتظار برای OTP
+    await this.updateUserStatus(this.currentUser.personalPhoneNumber, { lastStep: 'waiting_for_card_otp' });
+    const cardOtp = await this.waitForOtp('register_card');
+    
+    if (cardOtp) {
+      await this.enterOtp(cardOtp);
+      await this.clickByText('ادامه');
+    }
+  }
+
+  async processBankMellat() {
+    console.log('🏦 پردازش بانک مهر ایران');
+    
+    // وارد کردن شماره کارت
+    await this.fillByPlaceholder('شماره کارت', this.currentUser.cardNumber);
+    
+    // وارد کردن CVV2
+    await this.fillByPlaceholder('CVV2', this.currentUser.cvv2);
+    
+    // وارد کردن ماه انقضا
+    await this.fillByPlaceholder('ماه', this.currentUser.bankMonth.toString());
+    
+    // وارد کردن سال انقضا
+    await this.fillByPlaceholder('سال', this.currentUser.bankYear.toString());
+    
+    // وارد کردن کپچا (دستی)
+    console.log('⚠️ نیاز به وارد کردن دستی کپچا');
+    await this.page.waitForTimeout(10000);
+    
+    // کلیک روی دریافت رمز پویا
+    await this.clickByText('دریافت رمز پویا');
+    
+    // انتظار برای OTP
+    await this.updateUserStatus(this.currentUser.personalPhoneNumber, { lastStep: 'waiting_for_card_otp' });
+    const cardOtp = await this.waitForOtp('register_card');
+    
+    if (cardOtp) {
+      await this.fillByPlaceholder('رمز دوم', cardOtp);
+      await this.clickByText('تایید');
+    }
+  }
+
+  async step7_Deposit() {
+    console.log('💵 مرحله 7: واریز تومان');
+    
+    try {
+      // برگشت به صفحه اصلی یا کیف پول
+      await this.navigateTo(CONFIG.BASE_URL);
+      await this.step4_NavigateToWallet();
+      
+      // وارد کردن مبلغ
+      await this.fillByPlaceholder('مبلغ واریز را به تومان وارد نمایید', CONFIG.DEPOSIT_AMOUNT);
+      
+      // انتخاب بانک از لیست
+      const bankList = await this.page.$('#bank-list');
+      if (bankList) {
+        await bankList.click();
+        await this.page.waitForTimeout(1000);
+        
+        const bankName = this.getBankName(this.currentUser.cardNumber);
+        await this.page.click(`p:has-text("${bankName}")`);
+      }
+      
+      // کلیک روی واریز
+      await this.clickByTitle('واریز');
+      await this.page.waitForTimeout(2000);
+      
+      // کلیک روی تایید و پرداخت
+      await this.clickByTitle('تایید و پرداخت');
+      await this.page.waitForTimeout(3000);
+      
+      // انتظار برای OTP پرداخت
+      await this.updateUserStatus(this.currentUser.personalPhoneNumber, { lastStep: 'waiting_for_payment_otp' });
+      const paymentOtp = await this.waitForOtp('payment');
+      
+      if (paymentOtp) {
+        await this.enterOtp(paymentOtp);
+        await this.clickByText('تأیید');
+      }
+      
+      await this.page.waitForTimeout(5000);
+      
+      console.log('✅ مرحله 7 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 7:', error.message);
+      throw error;
+    }
+  }
+
+  async step8_BuyTether() {
+    console.log('🔄 مرحله 8: خرید تتر');
+    
+    try {
+      // رفتن به صفحه خرید
+      await this.navigateTo(CONFIG.BUY_URL);
+      await this.page.waitForTimeout(3000);
+      
+      // پیدا کردن و کلیک روی دکمه خرید
+      const buyButton = await this.page.$('.Button_button__A32Lt.Button_filled-primary__B_qAg');
+      if (buyButton) {
+        await buyButton.click();
+      } else {
+        await this.clickByText('خرید');
+      }
+      
+      await this.page.waitForTimeout(2000);
+      
+      // وارد کردن مبلغ
+      const amountInput = await this.page.$('.Input_input__wMmzD.Input_ltr__7PqEB');
+      if (amountInput) {
+        await amountInput.fill(CONFIG.DEPOSIT_AMOUNT);
+      }
+      
+      // کلیک روی ثبت سفارش
+      await this.clickByTitle('ثبت سفارش');
+      await this.page.waitForTimeout(5000);
+      
+      console.log('✅ مرحله 8 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 8:', error.message);
+      throw error;
+    }
+  }
+
+  async step9_WithdrawTether() {
+    console.log('📤 مرحله 9: برداشت تتر');
+    
+    try {
+      // رفتن به صفحه برداشت
+      await this.navigateTo(CONFIG.WITHDRAW_URL);
+      await this.page.waitForTimeout(3000);
+      
+      // جستجوی تتر
+      await this.fillByPlaceholder('جستجو', 'تتر');
+      await this.page.waitForTimeout(2000);
+      
+      // کلیک روی تتر
+      await this.page.click('p:has-text("تتر")');
+      await this.page.waitForTimeout(2000);
+      
+      // وارد کردن آدرس ولت
+      await this.fillByPlaceholder('آدرس ولت مقصد خود را وارد کنید', CONFIG.WITHDRAW_ADDRESS);
+      
+      // کلیک روی برداشت کل موجودی
+      await this.clickByTitle(/برداشت کل موجودی/);
+      await this.page.waitForTimeout(2000);
+      
+      // کلیک روی ثبت برداشت
+      await this.clickByTitle('ثبت برداشت');
+      await this.page.waitForTimeout(5000);
+      
+      console.log('✅ مرحله 9 تکمیل شد');
+      return true;
+    } catch (error) {
+      console.error('❌ خطا در مرحله 9:', error.message);
+      throw error;
+    }
+  }
+
+  // ==================== روش‌های کمکی ====================
+  getBankName(cardNumber) {
+    // تشخیص بانک براساس شماره کارت
+    const firstSix = cardNumber.substring(0, 6);
+    
+    // بانک ملی: 603799
+    if (cardNumber.startsWith('603799')) {
+      return 'بانک ملی';
+    }
+    // بانک مهر ایران: 610433
+    else if (cardNumber.startsWith('610433')) {
+      return 'بانک مهر ایران';
+    }
+    // بانک کشاورزی: 603770
+    else if (cardNumber.startsWith('603770')) {
+      return 'بانک کشاورزی';
+    }
+    // بانک تجارت: 585983
+    else if (cardNumber.startsWith('585983')) {
+      return 'بانک تجارت';
+    }
+    // پیش‌فرض
+    else {
+      return 'بانک ملی';
+    }
+  }
+
+  async processUser(user) {
+    const phoneNumber = user.personalPhoneNumber;
+    this.currentUser = user;
+    
+    let currentStep = 'start';
+    
+    try {
+      console.log(`\n🚀 شروع پردازش کاربر: ${phoneNumber}`);
+      console.log(`📱 شماره موبایل: ${phoneNumber}`);
+      console.log(`🏦 بانک: ${this.getBankName(user.cardNumber)}`);
+      
+      // چک کردن تعداد تلاش‌های قبلی
+      const retryCount = user.retryCount || 0;
+      if (retryCount >= CONFIG.MAX_RETRIES) {
+        console.log(`⛔ کاربر ${phoneNumber} به حداکثر تلاش‌ها رسیده است`);
+        await this.markAsFailed(phoneNumber, 'حداکثر تلاش‌ها انجام شده', 'max_retries');
+        return false;
+      }
+      
+      // علامت‌گذاری به عنوان در حال پردازش
+      await this.markAsProcessing(phoneNumber);
+      
+      // راه‌اندازی مرورگر
+      if (!await this.initializeBrowser()) {
+        throw new Error('راه‌اندازی مرورگر ناموفق بود');
+      }
+      
+      // اجرای مراحل
+      const steps = [
+        { name: 'ثبت‌نام', method: () => this.step1_Register(), retryable: true },
+        { name: 'رمز عبور', method: () => this.step2_Password(), retryable: true },
+        { name: 'تکمیل پروفایل', method: () => this.step3_CompleteProfile(), retryable: true },
+        { name: 'کیف پول', method: () => this.step4_NavigateToWallet(), retryable: true },
+        { name: 'افزودن قرارداد', method: () => this.step5_AddContract(), retryable: true },
+        { name: 'پردازش بانکی', method: () => this.step6_BankProcess(), retryable: true },
+        { name: 'واریز تومان', method: () => this.step7_Deposit(), retryable: true },
+        { name: 'خرید تتر', method: () => this.step8_BuyTether(), retryable: true },
+        { name: 'برداشت تتر', method: () => this.step9_WithdrawTether(), retryable: true }
+      ];
+      
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        currentStep = step.name;
+        
+        console.log(`\n📋 مرحله ${i + 1}/${steps.length}: ${step.name}`);
+        
         try {
-            this.log('💰 Step 4: Go to Wallet');
-            
-            await this.page.waitForTimeout(3000);
-            
-            const walletButton = await this.page.$('nav a:has-text("کیف پول"), [href*="/wallet"]');
-            if (walletButton) {
-                await walletButton.click();
-                this.log('✅ Wallet button clicked');
-            } else {
-                await this.page.goto('https://abantether.com/user/wallet', { waitUntil: 'domcontentloaded' });
-            }
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('10-wallet-page');
-            
-            const depositButton = await this.page.$('button:has-text("واریز"), a:has-text("واریز")');
-            if (depositButton) {
-                await depositButton.click();
-                this.log('✅ Deposit button clicked');
-                await this.page.waitForTimeout(2000);
-            }
-            
-            const tomanButton = await this.page.$('button:has-text("تومان"), a:has-text("تومان")');
-            if (tomanButton) {
-                await tomanButton.click();
-                this.log('✅ Toman button clicked');
-            }
-            
+          await step.method();
+          await this.updateUserStatus(phoneNumber, { lastStep: step.name + '_completed' });
+          
+          // تأخیر بین مراحل
+          if (i < steps.length - 1) {
             await this.page.waitForTimeout(2000);
-            await this.saveScreenshot('11-deposit-page');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in wallet navigation: ${error.message}`);
-            await this.saveScreenshot('error-wallet');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async step5AddContract(user) {
-        try {
-            this.log('📄 Step 5: Add Contract');
-            
-            await this.page.goto('https://abantether.com/user/wallet/deposit/irt/direct', { 
-                waitUntil: 'domcontentloaded',
-                timeout: 120000
-            });
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('12-contract-page');
-            
-            const addContractButton = await this.page.$('button:has-text("افزودن قرارداد")');
-            if (!addContractButton) {
-                throw new Error('Add contract button not found');
-            }
-            
-            await addContractButton.click();
-            this.log('✅ Add contract button clicked');
-            
-            await this.page.waitForTimeout(2000);
-            await this.saveScreenshot('13-add-contract-form');
-            
-            const bankName = user.bank || 'ملی';
-            const bankSelect = await this.page.$('select, [name*="bank"]');
-            if (bankSelect) {
-                await bankSelect.selectOption({ label: new RegExp(bankName) });
-                this.log(`✅ Bank selected: ${bankName}`);
-            }
-            
-            const contractDuration = await this.page.$('select, [name*="duration"]');
-            if (contractDuration) {
-                await contractDuration.selectOption({ label: '1 ماه' });
-                this.log('✅ Contract duration selected: 1 month');
-            }
-            
-            await this.saveScreenshot('14-contract-filled');
-            
-            const submitContractButton = await this.page.$('button:has-text("ثبت و ادامه")');
-            if (!submitContractButton) {
-                throw new Error('Submit contract button not found');
-            }
-            
-            await submitContractButton.click();
-            this.log('✅ Submit contract button clicked');
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('15-after-contract-submit');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in add contract: ${error.message}`);
-            await this.saveScreenshot('error-contract');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async step6BankProcess(user) {
-        try {
-            this.log('🏦 Step 6: Bank Process');
-            
-            const bank = user.bank || 'ملی';
-            
-            if (bank.includes('ملی')) {
-                return await this.processBankMelli(user);
-            } else if (bank.includes('مهر')) {
-                return await this.processBankMehrIran(user);
-            } else {
-                this.log(`⚠️ Bank ${bank} not specifically implemented, trying generic process`);
-                return await this.processGenericBank(user);
-            }
-        } catch (error) {
-            this.log(`❌ Error in bank process: ${error.message}`);
-            await this.saveScreenshot('error-bank');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async processBankMelli(user) {
-        try {
-            this.log('🏦 Processing Bank Melli');
-            
-            const bankLoginButton = await this.page.$('button:has-text("ورود با کارت بانک ملی")');
-            if (!bankLoginButton) {
-                throw new Error('Bank Melli login button not found');
-            }
-            
-            await bankLoginButton.click();
-            this.log('✅ Bank Melli login button clicked');
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('16-bank-melli-page');
-            
-            await this.solveCaptchaAndFillForm(user);
-            
-            return { success: true };
-        } catch (error) {
-            throw error;
-        }
-    }
-
-    async processBankMehrIran(user) {
-        try {
-            this.log('🏦 Processing Bank Mehr Iran');
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('16-bank-mehr-page');
-            
-            const cardNumberInput = await this.page.$('input[placeholder*="شماره کارت"], input[name*="card"]');
-            if (cardNumberInput) {
-                await cardNumberInput.fill(user.cardNumber);
-                this.log('✅ Card number entered');
-            }
-            
-            const cvvInput = await this.page.$('input[placeholder*="CVV2"], input[name*="cvv"]');
-            if (cvvInput) {
-                await cvvInput.fill(user.cvv2);
-                this.log('✅ CVV2 entered');
-            }
-            
-            const monthInput = await this.page.$('input[placeholder*="ماه"], select[name*="month"]');
-            if (monthInput) {
-                await monthInput.fill(user.bankMonth.toString());
-                this.log('✅ Month entered');
-            }
-            
-            const yearInput = await this.page.$('input[placeholder*="سال"], select[name*="year"]');
-            if (yearInput) {
-                await yearInput.fill(user.bankYear.toString());
-                this.log('✅ Year entered');
-            }
-            
-            await this.saveScreenshot('17-bank-form-filled');
-            
-            const captchaSolved = await this.solveCaptchaAndFillForm(user);
-            if (!captchaSolved) {
-                this.log('⚠️ Captcha solving failed, trying alternative');
-            }
-            
-            const dynamicPassButton = await this.page.$('button:has-text("دریافت رمز پویا")');
-            if (dynamicPassButton) {
-                await dynamicPassButton.click();
-                this.log('✅ Dynamic password button clicked');
-                await this.page.waitForTimeout(3000);
-            }
-            
-            const otpPayment = await this.waitForDatabaseField('otp_payment', 180000);
-            if (otpPayment) {
-                const otpInput = await this.page.$('input[placeholder*="رمز دوم"], input[name*="password"]');
-                if (otpInput) {
-                    await otpInput.fill(otpPayment);
-                    this.log('✅ Payment OTP entered');
-                }
-            }
-            
-            const confirmButton = await this.page.$('button:has-text("تایید")');
-            if (confirmButton) {
-                await confirmButton.click();
-                this.log('✅ Confirmed payment');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('18-after-bank-confirm');
-            
-            return { success: true };
-        } catch (error) {
-            throw error;
-        }
-    }
-
-    async processGenericBank(user) {
-        try {
-            this.log('🏦 Processing Generic Bank');
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('16-generic-bank-page');
-            
-            const cardNumberInput = await this.page.$('input[placeholder*="شماره کارت"]');
-            if (cardNumberInput) {
-                await cardNumberInput.fill(user.cardNumber);
-            }
-            
-            const cvvInput = await this.page.$('input[placeholder*="CVV2"]');
-            if (cvvInput) {
-                await cvvInput.fill(user.cvv2);
-            }
-            
-            await this.solveCaptchaAndFillForm(user);
-            
-            return { success: true };
-        } catch (error) {
-            throw error;
-        }
-    }
-
-    async solveCaptchaAndFillForm(user) {
-        try {
-            this.log('🔍 Solving captcha...');
-            
-            const captchaElement = await this.page.$('img[src*="captcha"], .captchaWrap img, #card-captcha-img');
-            if (captchaElement) {
-                const screenshot = await captchaElement.screenshot();
-                
-                const { data: { text } } = await Tesseract.recognize(screenshot, 'eng');
-                
-                const captchaCode = text.replace(/\s+/g, '').trim();
-                this.log(`✅ Captcha solved: ${captchaCode}`);
-                
-                const captchaInput = await this.page.$('input[placeholder*="عبارت امنیتی"], input[name*="captcha"]');
-                if (captchaInput) {
-                    await captchaInput.fill(captchaCode);
-                    this.log('✅ Captcha entered');
-                    await this.saveScreenshot('19-captcha-solved');
-                    return true;
-                }
-            }
-            
-            this.log('⚠️ Captcha element not found or solving failed');
-            return false;
-        } catch (error) {
-            this.log(`⚠️ Captcha solving error: ${error.message}`);
-            return false;
-        }
-    }
-
-    async step7CompleteDeposit() {
-        try {
-            this.log('💰 Step 7: Complete Deposit');
-            
-            await this.page.waitForTimeout(5000);
-            
-            const amountInput = await this.page.$('input[placeholder*="مبلغ واریزی"], input[name*="amount"]');
-            if (amountInput) {
-                await amountInput.fill(this.depositAmount);
-                this.log(`✅ Amount entered: ${this.depositAmount}`);
-            }
-            
-            const bankSelect = await this.page.$('select[name*="bank"], [placeholder*="نام بانک"]');
-            if (bankSelect) {
-                await bankSelect.selectOption({ label: /ملی/ });
-                this.log('✅ Bank selected: ملی');
-            }
-            
-            await this.saveScreenshot('20-deposit-amount-filled');
-            
-            const depositButton = await this.page.$('button:has-text("واریز")');
-            if (depositButton) {
-                await depositButton.click();
-                this.log('✅ Deposit button clicked');
-                await this.page.waitForTimeout(2000);
-            }
-            
-            const confirmButton = await this.page.$('button:has-text("تایید و پرداخت")');
-            if (confirmButton) {
-                await confirmButton.click();
-                this.log('✅ Confirm and pay button clicked');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('21-after-deposit-confirm');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in complete deposit: ${error.message}`);
-            await this.saveScreenshot('error-deposit');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async step8BuyTether() {
-        try {
-            this.log('🔄 Step 8: Buy Tether');
-            
-            await this.page.goto('https://abantether.com/user/trade/fast/buy?s=USDT', { 
-                waitUntil: 'domcontentloaded',
-                timeout: 120000
-            });
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('22-buy-tether-page');
-            
-            const amountInput = await this.page.$('input[name*="amount"], input[placeholder*="مقدار"]');
-            if (amountInput) {
-                await amountInput.fill(this.buyAmount);
-                this.log(`✅ Buy amount entered: ${this.buyAmount}`);
-            }
-            
-            await this.saveScreenshot('23-buy-amount-filled');
-            
-            const submitOrderButton = await this.page.$('button:has-text("ثبت سفارش")');
-            if (submitOrderButton) {
-                await submitOrderButton.click();
-                this.log('✅ Order submitted');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('24-after-buy');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in buy tether: ${error.message}`);
-            await this.saveScreenshot('error-buy');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async step9WithdrawTether() {
-        try {
-            this.log('📤 Step 9: Withdraw Tether');
-            
-            await this.page.goto('https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT', { 
-                waitUntil: 'domcontentloaded',
-                timeout: 120000
-            });
-            
-            await this.page.waitForTimeout(3000);
-            await this.saveScreenshot('25-withdraw-page');
-            
-            const currencySelect = await this.page.$('select[name*="currency"]');
-            if (currencySelect) {
-                await currencySelect.selectOption({ label: /تتر|USDT/ });
-                this.log('✅ Currency selected: Tether');
-            }
-            
-            const networkSelect = await this.page.$('select[name*="network"]');
-            if (networkSelect) {
-                await networkSelect.selectOption({ label: /BSC.*BEP20/ });
-                this.log('✅ Network selected: BSC(BEP20)');
-            }
-            
-            const addressInput = await this.page.$('input[placeholder*="آدرس ولت"], input[name*="address"]');
-            if (addressInput) {
-                await addressInput.fill(this.withdrawAddress);
-                this.log('✅ Wallet address entered');
-            }
-            
-            const amountInput = await this.page.$('input[placeholder*="مقدار"], input[name*="amount"]');
-            if (amountInput) {
-                await amountInput.fill(this.withdrawAmount);
-                this.log(`✅ Withdrawal amount entered: ${this.withdrawAmount}`);
-            }
-            
-            await this.saveScreenshot('26-withdraw-filled');
-            
-            const withdrawButton = await this.page.$('button:has-text("ثبت برداشت")');
-            if (withdrawButton) {
-                await withdrawButton.click();
-                this.log('✅ Withdrawal submitted');
-            }
-            
-            await this.page.waitForTimeout(5000);
-            await this.saveScreenshot('27-after-withdraw');
-            
-            return { success: true };
-        } catch (error) {
-            this.log(`❌ Error in withdraw tether: ${error.message}`);
-            await this.saveScreenshot('error-withdraw');
-            return { success: false, error: error.message };
-        }
-    }
-
-    async waitForDatabaseField(fieldName, timeout = 180000) {
-        this.log(`⏳ Waiting for ${fieldName} in database...`);
-        
-        const startTime = Date.now();
-        const phone = this.currentUser.personalPhoneNumber;
-        
-        while (Date.now() - startTime < timeout) {
-            try {
-                const user = await this.collection.findOne(
-                    { personalPhoneNumber: phone },
-                    { projection: { [fieldName]: 1 } }
-                );
-                
-                if (user && user[fieldName] && user[fieldName].trim() !== '') {
-                    const value = user[fieldName];
-                    this.log(`✅ ${fieldName} received: ${value}`);
-                    
-                    await this.collection.updateOne(
-                        { personalPhoneNumber: phone },
-                        { $unset: { [fieldName]: "" } }
-                    );
-                    
-                    return value;
-                }
-                
-                const elapsed = Math.floor((Date.now() - startTime) / 1000);
-                if (elapsed % 30 === 0) {
-                    this.log(`⏳ Still waiting for ${fieldName}... (${elapsed}s elapsed)`);
-                }
-                
-                await this.page.waitForTimeout(5000);
-                
-            } catch (error) {
-                this.log(`Error checking ${fieldName}: ${error.message}`);
-                await this.page.waitForTimeout(5000);
-            }
-        }
-        
-        this.log(`⏰ Timeout waiting for ${fieldName}`);
-        return null;
-    }
-
-    async markUserCompleted(phone, details = {}) {
-        try {
-            await this.collection.updateOne(
-                { personalPhoneNumber: phone },
-                {
-                    $set: {
-                        processed: true,
-                        status: 'completed',
-                        completedAt: new Date(),
-                        ...details
-                    }
-                }
-            );
-            this.log(`✅ User ${phone} marked as completed`);
-        } catch (error) {
-            this.log(`Error marking user as completed: ${error.message}`);
-        }
-    }
-
-    async markUserFailed(phone, reason) {
-        try {
-            await this.collection.updateOne(
-                { personalPhoneNumber: phone },
-                {
-                    $set: {
-                        status: 'failed',
-                        failureReason: reason,
-                        failedAt: new Date()
-                    }
-                }
-            );
-            this.log(`❌ User ${phone} marked as failed: ${reason}`);
-        } catch (error) {
-            this.log(`Error marking user as failed: ${error.message}`);
-        }
-    }
-
-    async closeBrowser() {
-        if (this.page) await this.page.close();
-        if (this.context) await this.context.close();
-        if (this.browser) await this.browser.close();
-        this.log('✅ Browser closed');
-    }
-
-    async start() {
-        await this.initialize();
-        await this.startPolling();
-        
-        process.on('SIGINT', async () => {
-            this.log('\n🛑 Stopping bot...');
+          }
+          
+        } catch (stepError) {
+          console.error(`❌ خطا در مرحله "${step.name}":`, stepError.message);
+          
+          if (step.retryable && retryCount < CONFIG.MAX_RETRIES - 1) {
+            console.log(`🔄 تلاش مجدد برای مرحله "${step.name}"...`);
+            await this.markAsRetry(phoneNumber, step.name, stepError.message);
+            
+            // بستن مرورگر و شروع مجدد
             await this.closeBrowser();
-            if (this.client) await this.client.close();
-            process.exit(0);
-        });
-        
-        this.log('🤖 Bot is running. Press Ctrl+C to stop.');
+            await this.page.waitForTimeout(CONFIG.RETRY_DELAY);
+            
+            // راه‌اندازی مجدد مرورگر
+            if (!await this.initializeBrowser()) {
+              throw new Error('راه‌اندازی مجدد مرورگر ناموفق بود');
+            }
+            
+            // تلاش مجدد برای مرحله فعلی
+            i--;
+            continue;
+          } else {
+            throw stepError;
+          }
+        }
+      }
+      
+      // تکمیل موفقیت‌آمیز
+      await this.markAsCompleted(phoneNumber, {
+        completedAt: new Date(),
+        processingTime: Date.now() - (user.startedAt?.getTime() || Date.now()),
+        completedSteps: steps.map(s => s.name)
+      });
+      
+      console.log(`🎉 پردازش کاربر ${phoneNumber} با موفقیت تکمیل شد`);
+      return true;
+      
+    } catch (error) {
+      console.error(`💥 خطای بحرانی برای کاربر ${phoneNumber}:`, error.message);
+      
+      await this.markAsFailed(phoneNumber, error.message, currentStep);
+      return false;
+      
+    } finally {
+      // بستن مرورگر
+      await this.closeBrowser();
+      
+      // حذف از لیست پردازش‌های فعال
+      this.activeProcesses.delete(phoneNumber);
+      this.currentUser = null;
     }
+  }
+
+  // ==================== سرویس اصلی ====================
+  async startService() {
+    console.log('🚀 سرویس ربات آبان تتر شروع شد');
+    console.log('⏱️ چک دیتابیس هر 30 ثانیه');
+    console.log('🔧 تنظیمات:', {
+      حداکثر_تلاش: CONFIG.MAX_RETRIES,
+      مبلغ_واریز: CONFIG.DEPOSIT_AMOUNT,
+      آدرس_برداشت: CONFIG.WITHDRAW_ADDRESS,
+      حالت_headless: CONFIG.HEADLESS
+    });
+    
+    // اتصال به دیتابیس
+    if (!await this.connectToDatabase()) {
+      console.error('❌ خاتمه به دلیل خطای دیتابیس');
+      return;
+    }
+    
+    // شروع پولینگ
+    this.startPolling();
+    
+    // هندل کردن خاتمه برنامه
+    process.on('SIGINT', async () => {
+      console.log('\n🛑 دریافت سیگنال خاتمه...');
+      await this.stopService();
+      process.exit(0);
+    });
+    
+    process.on('SIGTERM', async () => {
+      console.log('\n🛑 دریافت سیگنال ترمینیت...');
+      await this.stopService();
+      process.exit(0);
+    });
+  }
+
+  async startPolling() {
+    const poll = async () => {
+      try {
+        if (this.isProcessing) {
+          console.log('⏸️ در حال پردازش کاربران دیگر، رد شدن از چک');
+          return;
+        }
+        
+        this.isProcessing = true;
+        
+        // دریافت کاربران در انتظار
+        const pendingUsers = await this.getPendingUsers();
+        
+        // پردازش هر کاربر
+        for (const user of pendingUsers) {
+          // چک کردن اگر کاربر در حال پردازش است
+          if (this.activeProcesses.has(user.personalPhoneNumber)) {
+            console.log(`⏭️ کاربر ${user.personalPhoneNumber} در حال پردازش است`);
+            continue;
+          }
+          
+          // افزودن به لیست پردازش‌های فعال
+          this.activeProcesses.set(user.personalPhoneNumber, true);
+          
+          // پردازش غیرهمزمان
+          this.processUser(user).catch(error => {
+            console.error(`خطا در پردازش کاربر ${user.personalPhoneNumber}:`, error.message);
+            this.activeProcesses.delete(user.personalPhoneNumber);
+          });
+        }
+        
+      } catch (error) {
+        console.error('❌ خطا در پولینگ:', error.message);
+      } finally {
+        this.isProcessing = false;
+      }
+    };
+    
+    // اجرای اولیه
+    await poll();
+    
+    // تنظیم تایمر برای پولینگ دوره‌ای
+    setInterval(poll, CONFIG.POLLING_INTERVAL);
+    
+    console.log(`✅ پولینگ فعال شد (هر ${CONFIG.POLLING_INTERVAL / 1000} ثانیه)`);
+  }
+
+  async stopService() {
+    console.log('🛑 توقف سرویس...');
+    
+    // بستن مرورگر
+    await this.closeBrowser();
+    
+    // بستن اتصال دیتابیس
+    if (this.dbClient) {
+      await this.dbClient.close();
+      console.log('🔒 اتصال دیتابیس بسته شد');
+    }
+    
+    console.log('👋 سرویس متوقف شد');
+  }
 }
 
-// اجرای ربات
-const bot = new AbanTetherBot();
-bot.start().catch(console.error);
+// ==================== اجرای برنامه ====================
+if (require.main === module) {
+  // مدیریت خطاهای غیرمنتظره
+  process.on('uncaughtException', (error) => {
+    console.error('🔥 خطای غیرمنتظره:', error);
+  });
+  
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('🔥 ریجکت نشده در:', promise, 'به دلیل:', reason);
+  });
+  
+  // ایجاد و شروع ربات
+  const bot = new AbanTetherBot();
+  bot.startService().catch(error => {
+    console.error('❌ خطای شروع سرویس:', error);
+    process.exit(1);
+  });
+}
+
+module.exports = AbanTetherBot;
