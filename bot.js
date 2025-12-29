@@ -3,7 +3,7 @@ const { MongoClient } = require('mongodb');
 const fs = require('fs');
 
 // کانفیگ دیتابیس
-const MONGODB_URI = 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority';
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://zarin_db_user:zarin22@cluster0.ukd7zib.mongodb.net/ZarrinApp?retryWrites=true&w=majority';
 const DB_NAME = 'ZarrinApp';
 const COLLECTION_NAME = 'zarinapp';
 
@@ -16,8 +16,8 @@ const CONFIG = {
     buyUrl: 'https://abantether.com/user/trade/fast/buy?s=USDT',
     withdrawUrl: 'https://abantether.com/user/wallet/withdrawal/crypto?symbol=USDT',
     timeout: 60000,
-    headless: false,
-    slowMo: 300
+    headless: true, // در سرور باید true باشد
+    slowMo: 100
   },
   
   transaction: {
@@ -29,7 +29,7 @@ const CONFIG = {
   
   polling: {
     interval: 30000,
-    batchSize: 10
+    batchSize: 5
   }
 };
 
@@ -62,6 +62,11 @@ class AbanTetherAutoBot {
       this.db = this.client.db(DB_NAME);
       this.collection = this.db.collection(COLLECTION_NAME);
       console.log('✅ Connected to MongoDB successfully');
+      
+      // تست اتصال
+      const count = await this.collection.countDocuments({});
+      console.log(`📊 Total documents in database: ${count}`);
+      
       return true;
     } catch (error) {
       console.error('❌ MongoDB connection error:', error.message);
@@ -73,22 +78,12 @@ class AbanTetherAutoBot {
     try {
       console.log('🔍 Checking for pending users...');
       
-      // کوئری اصلی برای کاربران منتظر پردازش
+      // کوئری ساده برای تست
       const query = {
-        $and: [
-          { processed: { $ne: true } },
-          {
-            $or: [
-              { status: { $exists: false } },
-              { status: { $in: [null, 'processing', 'failed'] } }
-            ]
-          },
-          {
-            $or: [
-              { retryCount: { $exists: false } },
-              { retryCount: { $lt: CONFIG.transaction.maxRetries } }
-            ]
-          }
+        $or: [
+          { processed: { $exists: false } },
+          { processed: false },
+          { status: { $in: ['processing', 'failed', null] } }
         ]
       };
 
@@ -97,14 +92,12 @@ class AbanTetherAutoBot {
         .limit(CONFIG.polling.batchSize)
         .toArray();
       
-      console.log(`🎯 Found ${users.length} pending users ready for processing`);
+      console.log(`🎯 Found ${users.length} pending users`);
       
       if (users.length > 0) {
-        console.log('\n🎯 Pending Users List:');
+        console.log('\n📋 Pending Users:');
         users.forEach((user, index) => {
-          console.log(`👉 [${index + 1}] ${user.personalPhoneNumber} - ${user.personalName}`);
-          console.log(`   Status: ${user.status || 'new'}`);
-          console.log(`   Retry: ${user.retryCount || 0}/${CONFIG.transaction.maxRetries}`);
+          console.log(`${index + 1}. ${user.personalPhoneNumber} - ${user.personalName}`);
         });
       }
       
@@ -163,28 +156,33 @@ class AbanTetherAutoBot {
     });
   }
 
-  async updateStep(phoneNumber, step) {
-    return this.updateUserStatus(phoneNumber, {
-      lastStep: step,
-      lastStepTime: new Date()
-    });
-  }
-
   // ==================== بخش Playwright ====================
 
   async initializeBrowser() {
     try {
       console.log('🌐 Launching browser...');
-      this.browser = await chromium.launch({
+      
+      // تنظیمات مخصوص Railway/Docker
+      const launchOptions = {
         headless: CONFIG.website.headless,
         args: [
           '--no-sandbox',
           '--disable-setuid-sandbox',
           '--disable-dev-shm-usage',
-          '--window-size=1366,768'
+          '--disable-accelerated-2d-canvas',
+          '--disable-gpu',
+          '--window-size=1920,1080'
         ],
         slowMo: CONFIG.website.slowMo
-      });
+      };
+      
+      // اگر در Railway هستیم، تنظیمات اضافه
+      if (process.env.RAILWAY_ENVIRONMENT || process.env.NODE_ENV === 'production') {
+        launchOptions.executablePath = process.env.PLAYWRIGHT_CHROME_EXECUTABLE_PATH || '/usr/bin/chromium';
+        console.log('🚂 Railway environment detected');
+      }
+      
+      this.browser = await chromium.launch(launchOptions);
       console.log('✅ Browser launched successfully');
       return true;
     } catch (error) {
@@ -196,8 +194,8 @@ class AbanTetherAutoBot {
   async createPage() {
     try {
       const context = await this.browser.newContext({
-        viewport: { width: 1366, height: 768 },
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        viewport: { width: 1920, height: 1080 },
+        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         locale: 'fa-IR',
         timezoneId: 'Asia/Tehran'
       });
@@ -213,98 +211,53 @@ class AbanTetherAutoBot {
     }
   }
 
-  async takeScreenshot(stepName) {
+  async fillInput(page, placeholder, value) {
     try {
-      if (!fs.existsSync('screenshots')) {
-        fs.mkdirSync('screenshots');
-      }
-      const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const fileName = `screenshots/${this.currentUserPhone}_${stepName}_${timestamp}.png`;
-      await this.page.screenshot({ path: fileName, fullPage: true });
-      console.log(`📸 Screenshot saved: ${fileName}`);
-    } catch (error) {
-      console.error('❌ Failed to take screenshot:', error.message);
-    }
-  }
-
-  async smartFillByPlaceholder(page, placeholder, value) {
-    console.log(`🖊️  Filling placeholder "${placeholder}": ${value}`);
-    
-    try {
+      console.log(`📝 Filling ${placeholder}: ${value}`);
       const selector = `input[placeholder*="${placeholder}"]`;
       await page.waitForSelector(selector, { timeout: 10000 });
       await page.fill(selector, value);
-      console.log(`✅ Successfully filled placeholder "${placeholder}"`);
       await page.waitForTimeout(1000);
       return true;
     } catch (error) {
-      console.error(`❌ Could not find input with placeholder "${placeholder}"`);
+      console.error(`❌ Could not fill ${placeholder}`);
       return false;
     }
   }
 
-  async smartClickByTitle(page, titleText) {
-    console.log(`🖱️  Clicking element with title "${titleText}"`);
-    
+  async clickButton(page, text) {
     try {
-      const selector = `[title="${titleText}"]`;
+      console.log(`🖱️ Clicking: ${text}`);
+      const selector = `button:has-text("${text}"), a:has-text("${text}")`;
       await page.waitForSelector(selector, { timeout: 10000 });
       await page.click(selector);
-      console.log(`✅ Successfully clicked title "${titleText}"`);
       await page.waitForTimeout(2000);
       return true;
     } catch (error) {
-      console.error(`❌ Could not find element with title "${titleText}"`);
+      console.log(`⚠️ Could not click ${text}, trying alternative...`);
       return false;
     }
   }
 
-  async smartClickByText(page, text) {
-    console.log(`🖱️  Looking for element with text: "${text}"`);
-    
+  async clickByTitle(page, title) {
     try {
-      // اول سعی می‌کنیم دکمه را پیدا کنیم
-      const buttonSelector = `button:has-text("${text}")`;
-      const elements = await page.$$(buttonSelector);
-      
-      if (elements.length > 0) {
-        for (const element of elements) {
-          try {
-            const isVisible = await element.isVisible();
-            const isDisabled = await element.getAttribute('disabled');
-            
-            if (isVisible && !isDisabled) {
-              await element.click();
-              console.log(`✅ Clicked button with text "${text}"`);
-              await page.waitForTimeout(2000);
-              return true;
-            }
-          } catch (e) {
-            continue;
-          }
-        }
-      }
-      
-      // اگر دکمه پیدا نشد، هر المنت دیگری را امتحان می‌کنیم
-      const anySelector = `text="${text}"`;
-      await page.waitForSelector(anySelector, { timeout: 5000 });
-      await page.click(anySelector);
-      console.log(`✅ Clicked element with text "${text}"`);
+      console.log(`🖱️ Clicking title: ${title}`);
+      const selector = `[title="${title}"]`;
+      await page.waitForSelector(selector, { timeout: 10000 });
+      await page.click(selector);
       await page.waitForTimeout(2000);
       return true;
-      
     } catch (error) {
-      console.log(`⚠️ Could not find or click element with text "${text}"`);
-      console.log(`ℹ️ Will check if we can proceed to next step anyway`);
+      console.error(`❌ Could not click ${title}`);
       return false;
     }
   }
 
-  async waitForOtpField(page, fieldName) {
-    console.log(`⏳ Waiting for ${fieldName} in database...`);
+  async waitForOtp(page, fieldName) {
+    console.log(`⏳ Waiting for ${fieldName}...`);
     
     const startTime = Date.now();
-    const timeout = 120000; // 2 دقیقه
+    const timeout = 120000;
     
     while (Date.now() - startTime < timeout) {
       try {
@@ -317,30 +270,19 @@ class AbanTetherAutoBot {
           return user[fieldName];
         }
         
-        console.log(`⏰ Still waiting for ${fieldName}... ${Math.floor((Date.now() - startTime) / 1000)}s passed`);
         await page.waitForTimeout(5000);
       } catch (error) {
         await page.waitForTimeout(5000);
       }
     }
     
-    throw new Error(`Timeout waiting for ${fieldName}`);
+    return null;
   }
 
-  async checkUrlChange(page, previousUrl) {
-    const currentUrl = page.url();
-    if (currentUrl !== previousUrl) {
-      console.log(`📍 URL changed: ${currentUrl}`);
-      return true;
-    }
-    return false;
-  }
+  // ==================== مراحل ساده‌شده ====================
 
-  // ==================== مراحل اصلی ربات ====================
-
-  async step1_RegisterAndLogin(page, user) {
-    await this.updateStep(user.personalPhoneNumber, 'register');
-    console.log('📝 Step 1: Registration & Login');
+  async step1_Register(page, user) {
+    console.log('📝 Step 1: Registration');
     
     try {
       await page.goto(CONFIG.website.registerUrl, { 
@@ -348,462 +290,68 @@ class AbanTetherAutoBot {
         timeout: 60000 
       });
       await page.waitForTimeout(5000);
-      await this.takeScreenshot('01_register_page');
       
       // وارد کردن شماره موبایل
-      await this.smartFillByPlaceholder(page, 'شماره موبایل', user.personalPhoneNumber);
+      await this.fillInput(page, 'شماره موبایل', user.personalPhoneNumber);
       
-      // کلیک روی دکمه ثبت‌نام
-      await this.smartClickByTitle(page, 'ثبت‌نام');
+      // کلیک ثبت‌نام
+      await this.clickByTitle(page, 'ثبت‌نام');
       await page.waitForTimeout(5000);
-      await this.takeScreenshot('02_after_register_click');
       
-      // بررسی تغییر URL (اگر خودکار رفته باشد)
-      const initialUrl = page.url();
-      console.log(`📍 Current URL: ${initialUrl}`);
-      
-      if (!initialUrl.includes('/register')) {
-        console.log('✅ Auto-navigated to next step');
-        return;
-      }
-      
-      // اگر هنوز در صفحه ثبت‌نام هستیم، منتظر OTP می‌شویم
-      const loginOtp = await this.waitForOtpField(page, 'otp_login');
-      
-      if (loginOtp) {
-        console.log(`🔐 Entering login OTP: ${loginOtp}`);
-        await this.takeScreenshot('03_otp_page');
+      // اگر OTP نیاز بود
+      const otp = await this.waitForOtp(page, 'otp_login');
+      if (otp) {
+        await this.fillInput(page, 'کد ارسال شده', otp);
         
-        // وارد کردن OTP
-        await this.smartFillByPlaceholder(page, 'کد ارسال شده', loginOtp);
-        
-        // سعی می‌کنیم روی دکمه "بعد" کلیک کنیم
-        const beforeClickUrl = page.url();
-        const nextClicked = await this.smartClickByText(page, 'بعد');
-        
-        if (!nextClicked) {
-          console.log('⚠️ Could not find "بعد" button, checking URL change...');
-          
-          // بررسی می‌کنیم آیا URL تغییر کرده یا نه
+        // سعی در کلیک روی بعد
+        const clicked = await this.clickButton(page, 'بعد');
+        if (!clicked) {
+          console.log('ℹ️ Could not find "بعد" button, checking URL change...');
           await page.waitForTimeout(3000);
-          const afterWaitUrl = page.url();
-          
-          if (afterWaitUrl !== beforeClickUrl) {
-            console.log('✅ URL changed automatically, proceeding to next step');
-          } else {
-            console.log('⚠️ URL did not change, trying "ادامه" button...');
-            await this.smartClickByText(page, 'ادامه');
-            await page.waitForTimeout(3000);
-          }
         }
-        
-        await page.waitForTimeout(5000);
-        await this.takeScreenshot('04_after_otp');
       }
       
+      return true;
     } catch (error) {
-      console.error('❌ Error in step1:', error.message);
+      console.error('❌ Error in registration:', error.message);
       throw error;
     }
   }
 
-  async step2_EnterPassword(page) {
-    await this.updateStep(this.currentUserPhone, 'password');
-    console.log('🔑 Step 2: Entering Password');
+  async step2_Password(page) {
+    console.log('🔑 Step 2: Password');
     
     try {
-      await this.takeScreenshot('05_password_page');
-      
-      // وارد کردن رمز عبور
-      await this.smartFillByPlaceholder(page, 'رمز عبور', CONFIG.transaction.password);
-      
-      // کلیک روی تایید
-      await this.smartClickByTitle(page, 'تایید');
+      await this.fillInput(page, 'رمز عبور', CONFIG.transaction.password);
+      await this.clickByTitle(page, 'تایید');
       await page.waitForTimeout(5000);
-      await this.takeScreenshot('06_after_password');
-      
+      return true;
     } catch (error) {
-      console.error('❌ Error in step2:', error.message);
+      console.error('❌ Error in password step:', error.message);
       throw error;
     }
   }
 
-  async step3_CompleteProfile(page, user) {
-    await this.updateStep(user.personalPhoneNumber, 'profile');
-    console.log('👤 Step 3: Completing Profile');
+  async step3_Profile(page, user) {
+    console.log('👤 Step 3: Profile');
     
     try {
-      await this.takeScreenshot('07_profile_page');
+      await this.fillInput(page, 'کد ۱۰ رقمی شناسایی', user.personalNationalCode);
       
-      // وارد کردن کد ملی
-      await this.smartFillByPlaceholder(page, 'کد ۱۰ رقمی شناسایی', user.personalNationalCode);
-      
-      // وارد کردن تاریخ تولد
+      // تاریخ تولد
       try {
         const dobSelector = 'input[placeholder="روز/ماه/سال"]';
         await page.waitForSelector(dobSelector, { timeout: 10000 });
         await page.fill(dobSelector, user.personalBirthDate);
-        console.log(`✅ Set birth date: ${user.personalBirthDate}`);
       } catch (error) {
-        console.error('⚠️ Could not set birth date automatically');
+        console.error('⚠️ Could not set birth date');
       }
       
-      // کلیک روی دکمه ثبت
-      await this.smartClickByTitle(page, 'ثبت');
+      await this.clickByTitle(page, 'ثبت');
       await page.waitForTimeout(5000);
-      await this.takeScreenshot('08_after_profile');
-      
+      return true;
     } catch (error) {
-      console.error('❌ Error in step3:', error.message);
-      throw error;
-    }
-  }
-
-  async step4_AddBankContract(page, user) {
-    await this.updateStep(user.personalPhoneNumber, 'add_contract');
-    console.log('📋 Step 4: Adding Bank Contract');
-    
-    try {
-      await page.goto(CONFIG.website.depositUrl, { 
-        waitUntil: 'networkidle',
-        timeout: 60000 
-      });
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('09_deposit_page');
-      
-      // کلیک روی افزودن قرارداد
-      await this.smartClickByTitle(page, 'افزودن قرارداد');
-      await page.waitForTimeout(3000);
-      await this.takeScreenshot('10_add_contract_modal');
-      
-      // تشخیص بانک
-      const getBankName = (cardNumber) => {
-        if (!cardNumber) return 'بانک ملی';
-        if (cardNumber.startsWith('603799') || cardNumber.startsWith('610433')) {
-          return 'بانک ملی';
-        } else if (cardNumber.startsWith('606373')) {
-          return 'بانک مهر ایران';
-        }
-        return 'بانک ملی';
-      };
-      
-      const bankName = getBankName(user.cardNumber);
-      console.log(`🏦 Bank detected: ${bankName}`);
-      
-      // انتخاب بانک
-      await this.smartClickByText(page, 'نام بانک خود را انتخاب نمایید');
-      await page.waitForTimeout(1000);
-      await this.smartClickByText(page, bankName);
-      await page.waitForTimeout(1000);
-      
-      // انتخاب مدت قرارداد
-      await this.smartClickByText(page, 'مدت قرارداد خود را انتخاب کنید');
-      await page.waitForTimeout(1000);
-      await this.smartClickByText(page, '1 ماهه');
-      await page.waitForTimeout(1000);
-      
-      // کلیک روی ثبت و ادامه
-      await this.smartClickByTitle(page, 'ثبت و ادامه');
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('11_after_contract_submit');
-      
-    } catch (error) {
-      console.error('❌ Error in step4:', error.message);
-      throw error;
-    }
-  }
-
-  async step5_BankSpecificProcess(page, user) {
-    await this.updateStep(user.personalPhoneNumber, 'bank_process');
-    console.log('🏦 Step 5: Bank Specific Process');
-    
-    const getBankName = (cardNumber) => {
-      if (!cardNumber) return 'بانک ملی';
-      if (cardNumber.startsWith('603799') || cardNumber.startsWith('610433')) {
-        return 'بانک ملی';
-      } else if (cardNumber.startsWith('606373')) {
-        return 'بانک مهر ایران';
-      }
-      return 'بانک ملی';
-    };
-    
-    const bankName = getBankName(user.cardNumber);
-    
-    if (bankName === 'بانک ملی') {
-      await this.processMelliBank(page, user);
-    } else if (bankName === 'بانک مهر ایران') {
-      await this.processMehrIranBank(page, user);
-    }
-  }
-
-  async processMelliBank(page, user) {
-    console.log('🏦 Processing Melli Bank');
-    
-    try {
-      await this.takeScreenshot('12_melli_bank_page');
-      
-      // کلیک روی ورود با کارت بانک ملی
-      await this.smartClickByText(page, 'ورود با کارت بانک ملی');
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('13_melli_login_page');
-      
-      // وارد کردن شماره کارت
-      await this.smartFillByPlaceholder(page, 'شماره کارت', user.cardNumber);
-      
-      // منتظر کپچا
-      console.log('🕒 Waiting for manual captcha solving (20 seconds)...');
-      await page.waitForTimeout(20000);
-      await this.takeScreenshot('14_after_captcha');
-      
-      // کلیک روی ارسال رمز فعالسازی
-      await this.smartClickByText(page, 'ارسال رمز فعالسازی');
-      await page.waitForTimeout(5000);
-      
-      // انتظار برای OTP
-      const cardOtp = await this.waitForOtpField(page, 'otp_register_card');
-      
-      if (cardOtp) {
-        console.log(`🔐 Entering card OTP: ${cardOtp}`);
-        await this.takeScreenshot('15_otp_entry');
-        
-        // وارد کردن OTP
-        try {
-          const otpInputs = await page.$$('input[type="tel"], input[type="number"]');
-          for (let i = 0; i < Math.min(otpInputs.length, cardOtp.length); i++) {
-            await otpInputs[i].fill(cardOtp[i]);
-          }
-        } catch (error) {
-          await this.smartFillByPlaceholder(page, 'کد تأیید', cardOtp);
-        }
-        
-        // سعی می‌کنیم روی ادامه کلیک کنیم
-        const beforeClickUrl = page.url();
-        await this.smartClickByText(page, 'ادامه');
-        
-        // بررسی تغییر URL
-        await page.waitForTimeout(3000);
-        if (page.url() !== beforeClickUrl) {
-          console.log('✅ Proceeded to next step');
-        }
-        
-        await page.waitForTimeout(5000);
-        await this.takeScreenshot('16_after_otp_submit');
-      }
-      
-      // کلیک روی ثبت قرارداد
-      await this.smartClickByText(page, 'ثبت قرار داد');
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('17_contract_registered');
-      
-    } catch (error) {
-      console.error('❌ Error in Melli Bank process:', error.message);
-      throw error;
-    }
-  }
-
-  async processMehrIranBank(page, user) {
-    console.log('🏦 Processing Mehr Iran Bank');
-    
-    try {
-      await this.takeScreenshot('18_mehr_bank_page');
-      
-      // وارد کردن شماره کارت
-      await this.smartFillByPlaceholder(page, 'شماره کارت', user.cardNumber);
-      
-      // وارد کردن CVV2
-      await this.smartFillByPlaceholder(page, 'cvv2', user.cvv2);
-      
-      // وارد کردن ماه و سال انقضا
-      try {
-        const monthInputs = await page.$$('input[placeholder*="ماه"]');
-        if (monthInputs.length > 0) {
-          await monthInputs[0].fill(user.bankMonth.toString());
-        }
-        
-        const yearInputs = await page.$$('input[placeholder*="سال"]');
-        if (yearInputs.length > 0) {
-          await yearInputs[0].fill(user.bankYear.toString());
-        }
-      } catch (error) {
-        console.error('⚠️ Could not fill expiration date');
-      }
-      
-      // منتظر کپچا
-      console.log('🕒 Waiting for manual captcha solving (20 seconds)...');
-      await page.waitForTimeout(20000);
-      await this.takeScreenshot('19_after_captcha');
-      
-      // کلیک روی دریافت رمز پویا
-      await this.smartClickByText(page, 'دریافت رمز پویا');
-      await page.waitForTimeout(5000);
-      
-      // انتظار برای OTP
-      const cardOtp = await this.waitForOtpField(page, 'otp_register_card');
-      
-      if (cardOtp) {
-        console.log(`🔐 Entering dynamic password: ${cardOtp}`);
-        
-        // وارد کردن رمز دوم
-        await this.smartFillByPlaceholder(page, 'رمز دوم', cardOtp);
-        
-        // کلیک روی تایید
-        await this.smartClickByText(page, 'تایید');
-        await page.waitForTimeout(5000);
-        await this.takeScreenshot('20_after_otp');
-      }
-      
-    } catch (error) {
-      console.error('❌ Error in Mehr Iran Bank process:', error.message);
-      throw error;
-    }
-  }
-
-  async step6_DepositToman(page) {
-    await this.updateStep(this.currentUserPhone, 'deposit');
-    console.log('💰 Step 6: Depositing Toman');
-    
-    try {
-      // برگشت به صفحه اصلی
-      await page.goto(CONFIG.website.baseUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(3000);
-      
-      // رفتن به صفحه واریز
-      await page.goto(CONFIG.website.depositUrl, { waitUntil: 'networkidle' });
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('21_deposit_page_again');
-      
-      // وارد کردن مبلغ
-      await this.smartFillByPlaceholder(page, 'مبلغ واریز', CONFIG.transaction.depositAmount);
-      
-      // انتخاب بانک از لیست
-      try {
-        const bankList = await page.$('#bank-list');
-        if (bankList) {
-          await bankList.click();
-          await page.waitForTimeout(1000);
-          await this.takeScreenshot('22_bank_list');
-          
-          // انتخاب بانک ملی
-          await this.smartClickByText(page, 'بانک ملی');
-        }
-      } catch (error) {
-        console.error('⚠️ Could not select bank from list');
-      }
-      
-      // کلیک روی واریز
-      await this.smartClickByTitle(page, 'واریز');
-      await page.waitForTimeout(3000);
-      await this.takeScreenshot('23_before_payment_confirm');
-      
-      // کلیک روی تایید و پرداخت
-      await this.smartClickByTitle(page, 'تایید و پرداخت');
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('24_after_payment');
-      
-      // منتظر OTP پرداخت
-      const paymentOtp = await this.waitForOtpField(page, 'otp_payment');
-      
-      if (paymentOtp) {
-        console.log(`🔐 Entering payment OTP: ${paymentOtp}`);
-        await this.takeScreenshot('25_payment_otp_page');
-        
-        // وارد کردن OTP پرداخت
-        await this.smartFillByPlaceholder(page, 'کد تأیید', paymentOtp);
-        
-        await this.smartClickByText(page, 'تایید');
-        await page.waitForTimeout(10000);
-        await this.takeScreenshot('26_payment_complete');
-      }
-      
-    } catch (error) {
-      console.error('❌ Error in step6:', error.message);
-      throw error;
-    }
-  }
-
-  async step7_BuyTether(page) {
-    await this.updateStep(this.currentUserPhone, 'buy_tether');
-    console.log('🔄 Step 7: Buying Tether');
-    
-    try {
-      // رفتن به صفحه خرید
-      await page.goto(CONFIG.website.buyUrl, { 
-        waitUntil: 'networkidle',
-        timeout: 60000 
-      });
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('27_buy_page');
-      
-      // کلیک روی دکمه خرید
-      try {
-        const buyButtons = await page.$$('button');
-        for (const button of buyButtons) {
-          const text = await button.textContent();
-          if (text && text.includes('خرید')) {
-            await button.click();
-            break;
-          }
-        }
-      } catch (error) {
-        await this.smartClickByText(page, 'خرید');
-      }
-      
-      await page.waitForTimeout(3000);
-      await this.takeScreenshot('28_buy_modal');
-      
-      // وارد کردن مبلغ
-      await this.smartFillByPlaceholder(page, 'مبلغ', CONFIG.transaction.depositAmount);
-      
-      // کلیک روی ثبت سفارش
-      await this.smartClickByTitle(page, 'ثبت سفارش');
-      await page.waitForTimeout(10000);
-      await this.takeScreenshot('29_order_submitted');
-      
-    } catch (error) {
-      console.error('❌ Error in step7:', error.message);
-      throw error;
-    }
-  }
-
-  async step8_WithdrawTether(page) {
-    await this.updateStep(this.currentUserPhone, 'withdraw');
-    console.log('📤 Step 8: Withdrawing Tether');
-    
-    try {
-      // رفتن به صفحه برداشت
-      await page.goto(CONFIG.website.withdrawUrl, { 
-        waitUntil: 'networkidle',
-        timeout: 60000 
-      });
-      await page.waitForTimeout(5000);
-      await this.takeScreenshot('30_withdraw_page');
-      
-      // جستجوی تتر
-      await this.smartFillByPlaceholder(page, 'جستجو', 'تتر');
-      await page.waitForTimeout(2000);
-      await this.takeScreenshot('31_search_tether');
-      
-      // کلیک روی تتر
-      await this.smartClickByText(page, 'تتر');
-      await page.waitForTimeout(2000);
-      
-      // وارد کردن آدرس ولت
-      await this.smartFillByPlaceholder(page, 'آدرس ولت مقصد', CONFIG.transaction.withdrawAddress);
-      await this.takeScreenshot('32_address_filled');
-      
-      // کلیک روی برداشت کل موجودی
-      await this.smartClickByTitle(page, 'برداشت کل موجودی');
-      await page.waitForTimeout(2000);
-      
-      // کلیک روی ثبت برداشت
-      await this.smartClickByTitle(page, 'ثبت برداشت');
-      await page.waitForTimeout(10000);
-      await this.takeScreenshot('33_withdrawal_complete');
-      
-      console.log('✅ Withdrawal process initiated successfully');
-      
-    } catch (error) {
-      console.error('❌ Error in step8:', error.message);
+      console.error('❌ Error in profile step:', error.message);
       throw error;
     }
   }
@@ -812,87 +360,59 @@ class AbanTetherAutoBot {
     const phoneNumber = user.personalPhoneNumber;
     this.currentUserPhone = phoneNumber;
     
-    console.log(`\n🎯 ======== PROCESSING USER: ${phoneNumber} ========`);
-    console.log(`👤 Name: ${user.personalName}`);
-    console.log(`💳 Card: ${user.cardNumber}`);
+    console.log(`\n🎯 PROCESSING: ${phoneNumber} - ${user.personalName}`);
     
     if (this.activeUsers.has(phoneNumber)) {
-      console.log(`⏭️ User ${phoneNumber} is already being processed`);
+      console.log(`⏭️ Already processing`);
       return;
     }
     
     this.activeUsers.add(phoneNumber);
     
     try {
-      // ایجاد پوشه اسکرین‌شات
-      if (!fs.existsSync('screenshots')) {
-        fs.mkdirSync('screenshots');
-      }
-      
-      // علامت‌گذاری شروع پردازش
       await this.markAsProcessing(phoneNumber);
       
-      // ایجاد صفحه جدید
       const pageCreated = await this.createPage();
       if (!pageCreated) {
-        throw new Error('Failed to create browser page');
+        throw new Error('Failed to create page');
       }
       
-      // اجرای مراحل
+      // مراحل اصلی
       const steps = [
-        { name: 'Register & Login', method: () => this.step1_RegisterAndLogin(this.page, user) },
-        { name: 'Enter Password', method: () => this.step2_EnterPassword(this.page) },
-        { name: 'Complete Profile', method: () => this.step3_CompleteProfile(this.page, user) },
-        { name: 'Add Bank Contract', method: () => this.step4_AddBankContract(this.page, user) },
-        { name: 'Bank Process', method: () => this.step5_BankSpecificProcess(this.page, user) },
-        { name: 'Deposit Toman', method: () => this.step6_DepositToman(this.page) },
-        { name: 'Buy Tether', method: () => this.step7_BuyTether(this.page) },
-        { name: 'Withdraw Tether', method: () => this.step8_WithdrawTether(this.page) }
+        { name: 'Register', method: () => this.step1_Register(this.page, user) },
+        { name: 'Password', method: () => this.step2_Password(this.page) },
+        { name: 'Profile', method: () => this.step3_Profile(this.page, user) }
       ];
       
       for (const step of steps) {
         this.currentStep = step.name;
-        console.log(`\n🚀 [${step.name}] Starting...`);
+        console.log(`\n🚀 ${step.name}...`);
         
         try {
           await step.method();
-          console.log(`✅ [${step.name}] Completed`);
+          console.log(`✅ ${step.name} completed`);
         } catch (stepError) {
-          console.error(`❌ [${step.name}] Failed: ${stepError.message}`);
-          
-          // اگر خطا در مرحله اول بود، ادامه نمی‌دهیم
-          if (step.name === 'Register & Login') {
-            throw stepError;
-          }
-          
-          // برای مراحل دیگر، لاگ می‌کنیم اما ادامه می‌دهیم
-          console.log(`⚠️ Continuing despite error in ${step.name}`);
+          console.error(`❌ ${step.name} failed:`, stepError.message);
+          throw stepError;
         }
-        
-        await this.page.waitForTimeout(2000);
       }
       
-      // موفقیت آمیز
-      console.log(`\n✅ SUCCESS: User ${phoneNumber} completed all steps!`);
-      await this.markAsCompleted(phoneNumber, {
-        completedAt: new Date()
-      });
+      console.log(`\n✅ User ${phoneNumber} processed successfully`);
+      await this.markAsCompleted(phoneNumber);
       
     } catch (error) {
-      console.error(`\n❌ ERROR at step "${this.currentStep}" for user ${phoneNumber}:`, error.message);
-      
+      console.error(`\n❌ Failed for ${phoneNumber}:`, error.message);
       await this.markAsFailed(phoneNumber, error.message, this.currentStep);
       
-      // بررسی اگر تعداد تلاش‌ها به حداکثر رسید
+      // بررسی تعداد تلاش‌ها
       const userDoc = await this.collection.findOne({ personalPhoneNumber: phoneNumber });
       const retryCount = userDoc?.retryCount || 0;
       
       if (retryCount >= CONFIG.transaction.maxRetries) {
-        console.log(`⛔ User ${phoneNumber} reached maximum retries (${retryCount}/${CONFIG.transaction.maxRetries})`);
+        console.log(`⛔ Maximum retries reached for ${phoneNumber}`);
       }
       
     } finally {
-      // بستن صفحه
       if (this.page) {
         try {
           await this.page.close();
@@ -906,8 +426,6 @@ class AbanTetherAutoBot {
       this.currentUserPhone = null;
       this.currentStep = null;
       
-      // تأخیر بین کاربران
-      console.log('⏳ Waiting 10 seconds before next user...');
       await new Promise(resolve => setTimeout(resolve, 10000));
     }
   }
@@ -915,41 +433,39 @@ class AbanTetherAutoBot {
   // ==================== مدیریت اصلی ====================
 
   async startPolling() {
-    console.log('🔄 Starting polling service (every 30 seconds)...');
+    console.log('🔄 Polling started (30s interval)');
     
     this.pollingInterval = setInterval(async () => {
       if (this.isProcessing) {
-        console.log('⏸️ Already processing batch, skipping...');
         return;
       }
       
       this.isProcessing = true;
       
       try {
-        const pendingUsers = await this.getPendingUsers();
+        const users = await this.getPendingUsers();
         
-        if (pendingUsers.length === 0) {
-          console.log('😴 No pending users found');
+        if (users.length === 0) {
+          console.log('😴 No pending users');
           this.isProcessing = false;
           return;
         }
         
-        console.log(`👥 Processing ${pendingUsers.length} users...`);
+        console.log(`👥 Found ${users.length} users to process`);
         
-        for (const user of pendingUsers) {
+        for (const user of users) {
           if (this.activeUsers.size >= 1) {
-            console.log('⚠️ Maximum concurrent users (1) reached, waiting...');
             break;
           }
           
           this.processUser(user).catch(error => {
-            console.error('Unhandled error in user processing:', error);
+            console.error('Process error:', error);
           });
           
           await new Promise(resolve => setTimeout(resolve, 3000));
         }
       } catch (error) {
-        console.error('Error in polling cycle:', error);
+        console.error('Polling error:', error);
       } finally {
         this.isProcessing = false;
       }
@@ -957,42 +473,37 @@ class AbanTetherAutoBot {
   }
 
   async start() {
-    console.log('🚀 ======== AbanTether Auto Bot ========');
-    console.log('📅 Started at:', new Date().toLocaleString('fa-IR'));
+    console.log('🚀 AbanTether Bot Starting...');
+    console.log('📅', new Date().toLocaleString('fa-IR'));
+    console.log('⚙️  Headless mode:', CONFIG.website.headless);
     
     // اتصال به دیتابیس
     const dbConnected = await this.connectToDatabase();
     if (!dbConnected) {
-      console.error('❌ Cannot start without database connection');
+      console.error('❌ Database connection failed');
       process.exit(1);
     }
     
     // راه‌اندازی مرورگر
     const browserReady = await this.initializeBrowser();
     if (!browserReady) {
-      console.error('❌ Cannot start without browser');
+      console.error('❌ Browser failed to launch');
       process.exit(1);
     }
     
     // شروع پولینگ
     await this.startPolling();
     
-    // اجرای اولیه
-    this.isProcessing = false;
-    const initialUsers = await this.getPendingUsers();
-    console.log(`\n🔍 Initial check found ${initialUsers.length} pending users`);
-    
-    // سیگنال‌های خروج
+    // مدیریت سیگنال‌ها
     process.on('SIGINT', () => this.shutdown());
     process.on('SIGTERM', () => this.shutdown());
     
-    console.log('\n✅ Bot is running and monitoring database every 30 seconds');
-    console.log('📸 Screenshots will be saved in ./screenshots/');
-    console.log('\nPress Ctrl+C to stop the bot\n');
+    console.log('\n✅ Bot is running');
+    console.log('⏰ Checking every 30 seconds');
   }
 
   async shutdown() {
-    console.log('\n🛑 Shutting down bot...');
+    console.log('\n🛑 Shutting down...');
     
     if (this.pollingInterval) {
       clearInterval(this.pollingInterval);
@@ -1006,27 +517,25 @@ class AbanTetherAutoBot {
       await this.client.close();
     }
     
-    console.log('👋 Bot shutdown complete');
+    console.log('👋 Goodbye');
     process.exit(0);
   }
 }
 
-// ==================== اجرای ربات ====================
-
+// اجرا
 if (require.main === module) {
   const bot = new AbanTetherAutoBot();
   
   process.on('uncaughtException', (error) => {
-    console.error('\n🔥 Uncaught Exception:', error.message);
-    bot.shutdown();
+    console.error('🔥 Uncaught:', error.message);
   });
   
-  process.on('unhandledRejection', (reason, promise) => {
-    console.error('\n🔥 Unhandled Rejection at:', promise);
+  process.on('unhandledRejection', (reason) => {
+    console.error('🔥 Unhandled rejection:', reason);
   });
   
   bot.start().catch(error => {
-    console.error('Failed to start bot:', error);
+    console.error('Start failed:', error);
     process.exit(1);
   });
 }
