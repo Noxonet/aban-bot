@@ -1,18 +1,27 @@
 {
   "name": "abantether-bot",
-  "version": "2.0.0",
+  "version": "1.0.0",
+  "description": "ربات خودکار آبان تتر",
   "main": "Bot.js",
   "scripts": {
     "start": "node Bot.js",
-    "dev": "node Bot.js",
-    "install-chrome": "npx playwright install chromium",
-    "test-db": "node test-db.js"
+    "dev": "NODE_ENV=development node Bot.js",
+    "test": "echo \"No tests specified\" && exit 0",
+    "install-deps": "npx playwright install-deps && npx playwright install chromium"
   },
   "dependencies": {
     "playwright": "^1.40.0",
     "mongodb": "^6.0.0"
   },
   "engines": {
-    "node": ">=16.0.0"
-  }
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "abantether",
+    "bot",
+    "automation",
+    "crypto"
+  ],
+  "author": "taxman",
+  "license": "MIT"
 }
