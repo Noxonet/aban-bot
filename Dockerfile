@@ -1,40 +1,41 @@
-FROM node:18-alpine
+# Dockerfile for AbanTether Bot
+FROM mcr.microsoft.com/playwright:v1.40.0-focal
 
-# نصب chromium و dependencies
-RUN apk add --no-cache \
-    chromium \
-    nss \
-    freetype \
-    freetype-dev \
-    harfbuzz \
-    ca-certificates \
-    ttf-freefont \
-    font-noto-emoji \
-    wqy-zenhei
-
-# تنظیم محیط برای chromium
-ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
-ENV PLAYWRIGHT_CHROME_EXECUTABLE_PATH=/usr/bin/chromium-browser
-ENV NODE_ENV=production
-ENV CHROMIUM_PATH=/usr/bin/chromium-browser
-
-# جلوگیری از دانلود chromium اضافی
-ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
-
+# تنظیم دایرکتوری کار
 WORKDIR /app
 
-# کپی package.json
+# نصب پکیج‌های سیستم
+RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# کپی package.json و package-lock.json
 COPY package*.json ./
 
-# نصب dependencies
-RUN npm install --production
+# نصب وابستگی‌های Node.js
+RUN npm ci --only=production
 
-# کپی فایل‌های پروژه
+# کپی فایل‌های برنامه
 COPY . .
 
-# پورت
+# ایجاد دایرکتوری‌های لازم
+RUN mkdir -p screenshots logs
+
+# نصب مرورگر کرومیوم
+RUN npx playwright install chromium \
+    && npx playwright install-deps chromium
+
+# تنظیم متغیرهای محیطی
+ENV NODE_ENV=production
+ENV HEADLESS=true
+ENV TZ=Asia/Tehran
+
+# دسترسی‌های لازم
+RUN chmod +x /app/Bot.js
+
+# اکسپوز پورت (اگر نیاز باشد)
 EXPOSE 3000
 
-# اجرای ربات
-CMD ["node", "bot.js"]
+# کامند اجرا
+CMD ["node", "Bot.js"]

@@ -1,27 +1,38 @@
 {
   "name": "abantether-bot",
   "version": "1.0.0",
-  "description": "ربات خودکار آبان تتر",
+  "description": "ربات اتوماسیون کامل آبان تتر",
   "main": "Bot.js",
   "scripts": {
     "start": "node Bot.js",
-    "dev": "NODE_ENV=development node Bot.js",
-    "test": "echo \"No tests specified\" && exit 0",
-    "install-deps": "npx playwright install-deps && npx playwright install chromium"
-  },
-  "dependencies": {
-    "playwright": "^1.40.0",
-    "mongodb": "^6.0.0"
-  },
-  "engines": {
-    "node": ">=18.0.0"
+    "dev": "node Bot.js",
+    "docker:build": "docker build -t abantether-bot .",
+    "docker:run": "docker run -d --name abantether-bot --restart unless-stopped abantether-bot",
+    "docker:logs": "docker logs -f abantether-bot",
+    "docker:stop": "docker stop abantether-bot",
+    "docker:remove": "docker rm abantether-bot",
+    "docker:restart": "docker restart abantether-bot",
+    "docker:compose": "docker-compose up -d",
+    "docker:compose-down": "docker-compose down",
+    "docker:compose-logs": "docker-compose logs -f"
   },
   "keywords": [
     "abantether",
-    "bot",
     "automation",
-    "crypto"
+    "bot",
+    "playwright",
+    "mongodb"
   ],
-  "author": "taxman",
-  "license": "MIT"
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.13.4",
+    "mongodb": "^6.0.0",
+    "playwright": "^1.40.0",
+    "sharp": "^0.34.5",
+    "tesseract.js": "^5.1.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
 }
