@@ -46,7 +46,6 @@ async function resetAllUsers() {
   try {
     console.log('دریافت لیست کاربران...');
     
-    // 1. همه کاربران رو بگیر
     const findResponse = await makeRequest({
       operation: 'find',
       collection: 'zarinapp',
@@ -61,7 +60,6 @@ async function resetAllUsers() {
       return;
     }
     
-    // 2. برای هر کاربر updateOne بزن
     let successCount = 0;
     
     for (let i = 0; i < users.length; i++) {
@@ -71,26 +69,53 @@ async function resetAllUsers() {
       if (phone) {
         console.log(`(${i + 1}/${users.length}) آپدیت کاربر: ${phone}`);
         
-        const updateResponse = await makeRequest({
+        // تلاش با فرمت‌های مختلف
+        let updateResponse;
+        
+        // فرمت 1: با $set درون data
+        updateResponse = await makeRequest({
           operation: 'updateOne',
           collection: 'zarinapp',
           filter: { personalPhoneNumber: phone },
           data: {
-            processed: false,
-            status: 'pending',
-            lastUpdated: new Date().toISOString()
+            $set: {
+              processed: false,
+              status: 'pending',
+              lastUpdated: new Date().toISOString(),
+              retryCount: 0
+            }
           }
         });
+        
+        // اگر فرمت اول کار نکرد، فرمت 2 را امتحان کن
+        if (!updateResponse.success && updateResponse.message && 
+            updateResponse.message.includes('atomic operators')) {
+          console.log('   ⚠️ امتحان فرمت دوم...');
+          
+          updateResponse = await makeRequest({
+            operation: 'updateOne',
+            collection: 'zarinapp',
+            filter: { personalPhoneNumber: phone },
+            data: {
+              processed: false,
+              status: 'pending',
+              lastUpdated: new Date().toISOString(),
+              retryCount: 0
+            },
+            options: { upsert: false }
+          });
+        }
         
         if (updateResponse.success) {
           successCount++;
           console.log(`   ✅ موفق`);
         } else {
-          console.log(`   ❌ خطا`);
+          console.log(`   ❌ خطا:`, updateResponse.message || 'خطای ناشناخته');
+          // لاگ کامل پاسخ برای دیباگ
+          console.log('   پاسخ سرور:', JSON.stringify(updateResponse, null, 2));
         }
         
-        // کمی تأخیر برای جلوگیری از rate limiting
-        await new Promise(resolve => setTimeout(resolve, 300));
+        await new Promise(resolve => setTimeout(resolve, 500));
       }
     }
     

@@ -736,7 +736,7 @@ class AbanTetherBot {
         if (clicked) {
           console.log("✅ سال 1404 با evaluate پیدا و کلیک شد");
           year1404Clicked = true;
-          await this.page.waitForTimeout(1000);
+          await this.page.waitForTimeout(500);
         }
       }
 
@@ -801,11 +801,11 @@ class AbanTetherBot {
         // روش 1: با locator امتحان کن
         try {
           const yearLocator = this.page.locator(`text=${persianYear}`).first();
-          await yearLocator.waitFor({ state: "visible", timeout: 2000 });
+          await yearLocator.waitFor({ state: "visible", timeout: 1000 });
           await yearLocator.click();
           console.log(`✅ سال ${persianYear} با locator پیدا و کلیک شد!`);
           yearFound = true;
-          await this.page.waitForTimeout(1000);
+          await this.page.waitForTimeout(500);
           break;
         } catch (error) {
           console.log(`⚠️ سال ${persianYear} با locator پیدا نشد`);
@@ -849,7 +849,6 @@ class AbanTetherBot {
           if (clicked) {
             console.log(`✅ سال ${persianYear} با evaluate پیدا و کلیک شد!`);
             yearFound = true;
-            await this.page.waitForTimeout(1000);
             break;
           }
         }
